@@ -166,13 +166,49 @@ public final class ChatSession {
         mutating func record(
             _ assistant: AssistantGeneration,
             generatedTokens: [Int],
-            processedTokenCount: Int
+            processedTokenCount: Int,
+            prefillTokenCount: Int,
+            mainCache: KVCacheStorage,
+            draftCache: KVCacheStorage?
         ) -> Bool {
             guard assistant.shouldRecord else {
-                // A cancelled or semantically empty generation has no
-                // assistant turn to replay. Its cache may nevertheless
-                // contain generated or lookahead tokens, so invalidate
-                // the ledger and rebuild from the retained messages.
+                // Retain the last token of the prefill window the cold render can
+                // reproduce. `prefillTokenCount` (P) is the prompt size at the
+                // cancelled request, not the carried ledger size, so a cancel that
+                // lands mid-prefill still keeps a usable P-1 prefix.
+                let confirmedTokenCount = min(processedTokenCount, prefillTokenCount)
+                let retainedTokenCount = confirmedTokenCount - 1
+                let canRetainCancelledPrefix =
+                    retainedTokenCount > 0
+                    && (assistant.wasTerminatedByConsumer || assistant.stopReason == .cancelled)
+                    && mainCache.processedTokenCount == processedTokenCount
+                    && canTrimPromptCache(mainCache.cache)
+                    && (draftCache.map {
+                        $0.processedTokenCount == processedTokenCount
+                            && canTrimPromptCache($0.cache)
+                    } ?? true)
+
+                if canRetainCancelledPrefix {
+                    let trimCount = processedTokenCount - retainedTokenCount
+                    let mainTrimmed = mainCache.trim(trimCount)
+                    let draftTrimmed = draftCache.map { $0.trim(trimCount) }
+                    let didTrimMain =
+                        mainTrimmed == trimCount
+                        && mainCache.processedTokenCount == retainedTokenCount
+                    let didTrimDraft = draftCache.map { cache in
+                        draftTrimmed == trimCount
+                            && cache.processedTokenCount == retainedTokenCount
+                    } ?? true
+
+                    if didTrimMain && didTrimDraft {
+                        cachedTokens.removeLast()
+                        uncommittedTokens.removeAll()
+                        return false
+                    }
+                }
+
+                // A cache that cannot be proven to match the retained transcript
+                // must be rebuilt before the next request.
                 cachedTokens.removeAll()
                 uncommittedTokens.removeAll()
                 return false
@@ -1375,7 +1411,10 @@ public final class ChatSession {
                             let recordedAssistant = currentConversation.record(
                                 assistant,
                                 generatedTokens: generatedTokens,
-                                processedTokenCount: kvCache.processedTokenCount)
+                                processedTokenCount: kvCache.processedTokenCount,
+                                prefillTokenCount: input.text.tokens.size,
+                                mainCache: kvCache,
+                                draftCache: draftKVCache)
                             if !recordedAssistant,
                                 let conversationMessageCountBeforePending
                             {

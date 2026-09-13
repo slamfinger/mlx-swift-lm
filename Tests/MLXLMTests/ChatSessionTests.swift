@@ -515,6 +515,46 @@ public class ChatSessionTests: XCTestCase {
         XCTAssertEqual(calls[1].first?.content, "second question")
     }
 
+    /// A cancelled generation retains an aligned P-1 prefix for an exact retry.
+    func testCancelThenExactRetryReusesWarmPrefix() async throws {
+        let (renderedLengths, continuation) = AsyncStream<Int>.makeStream()
+        var lengthIterator = renderedLengths.makeAsyncIterator()
+        let tokenizer = PrefixPreservingTokenizer(renderedLengthContinuation: continuation)
+        let processor = TestInputProcessor(
+            tokenizer: tokenizer,
+            configuration: ModelConfiguration(id: "test"),
+            messageGenerator: DefaultMessageGenerator())
+        let session = ChatSession(
+            model(processor: processor),
+            generateParameters: GenerateParameters(maxTokens: 3))
+
+        // First turn: cancel mid-stream before the generation completes.
+        for try await _ in session.streamResponse(to: "first") {
+            break
+        }
+        await session.synchronize()
+
+        let firstRenderedLengthValue = await lengthIterator.next()
+        let firstRenderedLength = try XCTUnwrap(firstRenderedLengthValue)
+        XCTAssert(firstRenderedLength > 0)
+
+        // Exact retry: same prompt.
+        var completionInfo: GenerateCompletionInfo?
+        for try await item in session.streamDetails(to: "first") {
+            if let info = item.info {
+                completionInfo = info
+            }
+        }
+
+        let secondRenderedLengthValue = await lengthIterator.next()
+        let secondRenderedLength = try XCTUnwrap(secondRenderedLengthValue)
+        let info = try XCTUnwrap(completionInfo)
+        XCTAssertEqual(firstRenderedLength, secondRenderedLength)
+        XCTAssertEqual(info.promptTokenCount, 1)
+        XCTAssertEqual(info.cachedPromptTokenCount, secondRenderedLength - 1)
+        XCTAssertEqual(info.totalPromptTokenCount, secondRenderedLength)
+    }
+
     func testEmptyPreparedInputThrowsClearError() async throws {
         let tokenizer = EmptyChatTemplateTokenizer()
         let processor = TestInputProcessor(
