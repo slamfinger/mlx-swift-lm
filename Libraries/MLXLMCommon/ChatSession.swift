@@ -1096,6 +1096,11 @@ public final class ChatSession {
                         // hit-rate telemetry on `.info`: `extend`, `extend-main`,
                         // `exact-n1`, `rewind`, `fork-no-rewind`, `rebuild`, `cold`.
                         var cacheReuseMode: String?
+                        // Fork observability: for `fork-no-rewind`, the divergence
+                        // point (common prompt prefix vs ledger length) so hybrid
+                        // rebuilds attribute to a token position.
+                        var cacheForkCommonTokens: Int?
+                        var cacheForkLedgerTokens: Int?
                         // Set when a rewind decision was applied but its trim fell
                         // short of the target, downgrading to a rebuild.
                         var rebuildAfterFailedRewind = false
@@ -1239,6 +1244,12 @@ public final class ChatSession {
                                 cacheReuseMode =
                                     cacheState.cachedTokens.isEmpty || rebuildAfterFailedRewind
                                     ? "rebuild" : "fork-no-rewind"
+                                if cacheReuseMode == "fork-no-rewind" {
+                                    cacheForkCommonTokens = zip(
+                                        promptTokenIds, cacheState.cachedTokens
+                                    ).prefix { $0 == $1 }.count
+                                    cacheForkLedgerTokens = cacheState.cachedTokens.count
+                                }
                             }
 
                             reusedMainCacheWithoutDraft =
@@ -1418,7 +1429,10 @@ public final class ChatSession {
 
                         for await item in generation.stream {
                             let item = item.attributingCachedPromptTokens(
-                                cachedPromptTokenCount, reuseMode: cacheReuseMode)
+                                cachedPromptTokenCount,
+                                reuseMode: cacheReuseMode,
+                                forkCommon: cacheForkCommonTokens,
+                                forkLedger: cacheForkLedgerTokens)
                             assistant.consume(item)
 
                             // collect tool calls for dispatch; if no
