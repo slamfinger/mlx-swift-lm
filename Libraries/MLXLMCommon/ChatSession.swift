@@ -1092,6 +1092,13 @@ public final class ChatSession {
                         // Prompt tokens this turn does not prefill because the cache
                         // already represents them. Reported to the caller on `.info`.
                         var cachedPromptTokenCount = 0
+                        // Which physical cache path this turn took, for continuous
+                        // hit-rate telemetry on `.info`: `extend`, `extend-main`,
+                        // `exact-n1`, `rewind`, `fork-no-rewind`, `rebuild`, `cold`.
+                        var cacheReuseMode: String?
+                        // Set when a rewind decision was applied but its trim fell
+                        // short of the target, downgrading to a rebuild.
+                        var rebuildAfterFailedRewind = false
                         // Read off the prepared input, not `input`: the latter may be narrowed to
                         // a token-only suffix below, which would hide media the model still sees.
                         let carriesPreparedMedia =
@@ -1161,22 +1168,44 @@ public final class ChatSession {
 
                                 if !(mainTrimIsAligned && draftTrimIsAligned) {
                                     decision = .rebuild
+                                    rebuildAfterFailedRewind = true
+                                }
+                            } else if case .exactMatchRefresh(let refreshIndex) = decision {
+                                // Exact match trims exactly one row off every cache
+                                // and carries the same failure contract: verify the
+                                // trim before feeding the refresh token.
+                                let mainTrimmed = kvCache.trim(1)
+                                let draftTrimmed = draftKVCache.map { $0.trim(1) }
+                                let mainTrimIsAligned =
+                                    mainTrimmed == 1
+                                    && kvCache.processedTokenCount == refreshIndex
+                                let draftTrimIsAligned =
+                                    draftKVCache.map { draftCache in
+                                        draftTrimmed == 1
+                                            && draftCache.processedTokenCount == refreshIndex
+                                    } ?? true
+
+                                if !(mainTrimIsAligned && draftTrimIsAligned) {
+                                    decision = .rebuild
+                                    rebuildAfterFailedRewind = true
                                 }
                             }
 
                             switch decision {
                             case .prefillAll:
-                                break
+                                cacheReuseMode = "cold"
 
                             case .appendSuffix(let suffixStart, _):
                                 input = LMInput(
                                     tokens: MLXArray(Array(promptTokenIds[suffixStart...])))
                                 cachedPromptTokenCount = suffixStart
+                                cacheReuseMode = "extend"
 
                             case .appendSuffixToMain(let suffixStart, _):
                                 input = LMInput(
                                     tokens: MLXArray(Array(promptTokenIds[suffixStart...])))
                                 cachedPromptTokenCount = suffixStart
+                                cacheReuseMode = "extend-main"
                                 // The draft does not represent the same private
                                 // Harmony path. Preserve the authoritative main
                                 // cache and use it alone for this continuation.
@@ -1188,6 +1217,15 @@ public final class ChatSession {
                                     tokens: MLXArray(
                                         Array(promptTokenIds.dropFirst(commonPrefixLength))))
                                 cachedPromptTokenCount = commonPrefixLength
+                                cacheReuseMode = "rewind"
+
+                            case .exactMatchRefresh(let refreshIndex):
+                                // The caches kept N-1 tokens; re-feed the final
+                                // prompt token so generation starts from fresh
+                                // logits over the fully cached prompt.
+                                input = LMInput(tokens: MLXArray([promptTokenIds[refreshIndex]]))
+                                cachedPromptTokenCount = refreshIndex
+                                cacheReuseMode = "exact-n1"
 
                             case .rebuild:
                                 kvCache = KVCacheStorage(
@@ -1195,6 +1233,12 @@ public final class ChatSession {
                                     plan: kvCachePlan)
                                 draftKVCache = nil
                                 lmState = nil
+                                // A rebuild with a non-empty ledger means a warm
+                                // cache existed but could not be reconciled and no
+                                // rewind was applied (fork, unwinding-unsafe carry).
+                                cacheReuseMode =
+                                    cacheState.cachedTokens.isEmpty || rebuildAfterFailedRewind
+                                    ? "rebuild" : "fork-no-rewind"
                             }
 
                             reusedMainCacheWithoutDraft =
@@ -1209,7 +1253,7 @@ public final class ChatSession {
                             case .appendSuffix(_, let representedTokens),
                                 .appendSuffixToMain(_, let representedTokens):
                                 currentConversation.cachedTokens = representedTokens
-                            case .prefillAll, .trimToCommonPrefix, .rebuild:
+                            case .prefillAll, .trimToCommonPrefix, .exactMatchRefresh, .rebuild:
                                 currentConversation.cachedTokens = promptTokenIds
                             }
                             currentConversation.uncommittedTokens.removeAll()
@@ -1322,6 +1366,7 @@ public final class ChatSession {
                                         lmState = nil
                                         input = preparedInput
                                         cachedPromptTokenCount = 0
+                                        cacheReuseMode = "rebuild"
                                     }
 
                                     // Allocate the draft KV cache once and reuse it across turns,
@@ -1372,7 +1417,8 @@ public final class ChatSession {
                         var assistant = AssistantGeneration()
 
                         for await item in generation.stream {
-                            let item = item.attributingCachedPromptTokens(cachedPromptTokenCount)
+                            let item = item.attributingCachedPromptTokens(
+                                cachedPromptTokenCount, reuseMode: cacheReuseMode)
                             assistant.consume(item)
 
                             // collect tool calls for dispatch; if no

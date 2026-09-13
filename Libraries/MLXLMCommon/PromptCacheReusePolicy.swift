@@ -30,6 +30,18 @@ enum PromptCacheReuseDecision: Equatable {
     /// feed `promptTokens[commonPrefixLength...]`.
     case trimToCommonPrefix(commonPrefixLength: Int, trimCount: Int)
 
+    /// The prompt is token-identical to the physical ledger. Keep KV for
+    /// `refreshIndex` tokens and re-feed only `promptTokens[refreshIndex]`,
+    /// the final prompt token, so generation starts from fresh logits over
+    /// an otherwise fully cached prompt.
+    ///
+    /// This is the historical exact-match continuation, and it is
+    /// deliberately narrower than generic rewind: every participating cache
+    /// layer must be trimmable, so a hybrid cache with non-rewindable state
+    /// (e.g. GDN layers) falls through to ``.rebuild`` even on an identical
+    /// prompt.
+    case exactMatchRefresh(refreshIndex: Int)
+
     /// The cache cannot be reconciled with this prompt. Discard it, drop any
     /// carried model state, and feed the whole prompt.
     case rebuild
@@ -37,7 +49,7 @@ enum PromptCacheReuseDecision: Equatable {
     /// `true` when a non-empty cached prefix is carried into this turn.
     var reusesCachedPrefix: Bool {
         switch self {
-        case .appendSuffix, .appendSuffixToMain, .trimToCommonPrefix:
+        case .appendSuffix, .appendSuffixToMain, .trimToCommonPrefix, .exactMatchRefresh:
             return true
         case .prefillAll, .rebuild:
             return false
@@ -134,6 +146,7 @@ struct PromptCacheReusePolicy: Sendable {
 
     /// Rules that apply to every model, in priority order.
     static let standardRules: [any PromptCacheReuseRule] = [
+        ExactMatchRefreshRule(),
         ExtendCachedPrefixRule(),
         RewindToCommonPrefixRule(),
     ]
@@ -160,6 +173,39 @@ struct PromptCacheReusePolicy: Sendable {
 }
 
 // MARK: - Standard rules
+
+/// Reconnects the historical exact-match continuation: when the rendered
+/// prompt is token-identical to the physical ledger, keep KV for N-1 tokens
+/// and re-feed only the final prompt token.
+///
+/// Every gate of the rewind path must hold — alignment of both caches and
+/// trimmability of every participating layer — because a cache that cannot
+/// rewind safely (e.g. hybrid GDN layers) must rebuild even when the prompt
+/// is identical. A single-token prompt has nothing worth keeping, so it is
+/// left to the terminal rewind rule, which prefills it whole.
+struct ExactMatchRefreshRule: PromptCacheReuseRule {
+    func reuse(turn: PromptCacheTurn, cache: PromptCacheState) -> PromptCacheReuseDecision? {
+        let commonPrefixLength = zip(turn.promptTokens, cache.cachedTokens)
+            .prefix { $0 == $1 }
+            .count
+
+        guard commonPrefixLength == cache.cachedTokens.count,
+            commonPrefixLength == turn.promptTokens.count,
+            commonPrefixLength > 1,
+            cache.mainCacheIsAligned,
+            cache.draftCacheIsAligned,
+            cache.isTrimmable,
+            !turn.carriesNewMedia,
+            !turn.carriesPreparedMedia,
+            !turn.carriesAttentionMask,
+            !turn.carriesModelState
+        else {
+            return nil
+        }
+
+        return .exactMatchRefresh(refreshIndex: commonPrefixLength - 1)
+    }
+}
 
 /// Appends the trailing tokens when the prompt strictly extends the cache.
 struct ExtendCachedPrefixRule: PromptCacheReuseRule {

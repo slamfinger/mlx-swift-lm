@@ -81,12 +81,63 @@ struct PromptCacheReusePolicyTests {
         #expect(decision.reusesCachedPrefix)
     }
 
-    @Test func `an identical prompt has no suffix to append and rebuilds`() {
-        // No new tokens: the common prefix spans the whole prompt, so there is
-        // nothing to prefill and nothing safe to rewind to.
+    @Test func `an identical prompt on a trimmable cache refreshes the final token`() {
+        // The historical exact-match continuation: keep KV for N-1 tokens and
+        // re-feed only the final prompt token.
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 3]), cache: alignedCache([1, 2, 3]))
+
+        #expect(decision == .exactMatchRefresh(refreshIndex: 2))
+        #expect(decision.reusesCachedPrefix)
+    }
+
+    @Test func `an identical prompt on a non-trimmable cache still rebuilds`() {
+        // Hybrid caches with non-rewindable state (e.g. GDN layers) must not be
+        // rewound even when the prompt is token-identical.
         #expect(
             PromptCacheReusePolicy().decide(
-                turn: turn(prompt: [1, 2, 3]), cache: alignedCache([1, 2, 3])) == .rebuild)
+                turn: turn(prompt: [1, 2, 3]), cache: alignedCache([1, 2, 3], trimmable: false))
+                == .rebuild)
+    }
+
+    @Test func `a single-token identical prompt rebuilds rather than trimming to nothing`() {
+        // Keeping KV for N-1 tokens when N == 1 means discarding the whole
+        // cache, which is a prefill, not a refresh.
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1]), cache: alignedCache([1])) == .rebuild)
+    }
+
+    @Test(arguments: ["draft misaligned", "main misaligned"])
+    func `an identical prompt with misaligned caches rebuilds`(blocker: String) {
+        let cache =
+            blocker == "draft misaligned"
+            ? alignedCache([1, 2, 3], draftAligned: false)
+            : PromptCacheState(
+                cachedTokens: [1, 2, 3],
+                processedTokenCount: 12,
+                mainCacheIsAligned: false,
+                isTrimmable: true)
+
+        #expect(
+            PromptCacheReusePolicy().decide(turn: turn(prompt: [1, 2, 3]), cache: cache)
+                == .rebuild)
+    }
+
+    @Test(arguments: ["new media", "prepared media", "attention mask", "model state"])
+    func `an exact match is refused when the turn carries unwinding-unsafe state`(
+        blocker: String
+    ) {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(
+                prompt: [1, 2, 3],
+                newMedia: blocker == "new media",
+                preparedMedia: blocker == "prepared media",
+                attentionMask: blocker == "attention mask",
+                modelState: blocker == "model state"),
+            cache: alignedCache([1, 2, 3]))
+
+        #expect(decision == .rebuild)
     }
 
     @Test func `a misaligned draft cache blocks suffix reuse`() {
