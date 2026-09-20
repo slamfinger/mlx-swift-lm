@@ -143,13 +143,16 @@ final class COWForkKVCache: BaseKVCache {
     var privateRows: Int { privateKeys?.dim(2) ?? 0 }
 }
 
-/// 模型级 cache fork:attention(KVCacheSimple)→ page-split 子代;
+/// 模型级 cache fork:attention(KVCacheSimple / COWForkKVCache 段表)
+/// → page-split 子代(COW→COW = 复制段表 + 追加父私有尾段);
 /// GDN(MambaCache)→ 引用子代(两槽函数式更新,零拷贝)。
 func forkModelCache(_ cache: [KVCache]) -> [KVCache] {
     cache.map { layer in
         switch layer {
         case let simple as KVCacheSimple:
             return COWForkKVCache(parent: simple)
+        case let cow as COWForkKVCache:
+            return COWForkKVCache(parent: cow)
         case let mamba as MambaCache:
             let child = MambaCache()
             for slot in 0..<mamba.slotCount {
