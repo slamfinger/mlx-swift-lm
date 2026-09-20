@@ -24,26 +24,64 @@ import BenchmarkHelpers
 
 // MARK: - 共享原型(F1 提升为文件级)
 
-/// F1/F2 原型:共享前缀(父代缓冲只读)+ 私有后缀(子代自增长)。
-/// 返回视图 = concatenated(共享前缀, 私有已用行)。
+/// F3 起升级为段表(page table)v2:共享前缀 = 任意条只读段(段 = 父代
+/// 缓冲 + 逻辑行数),支持 COW→COW 多级 fork(fork O(1):只复制段表;
+/// 安全性 = append-only 缓冲上行区间不相交 + 增长拼接换新缓冲不回写)。
+/// 返回视图 = concatenated(各段视图, 私有已用行)。
 /// 非生产 API —— 只存在于 exp/execution-state-fork。
 final class COWForkKVCache: BaseKVCache {
-    let sharedKeys: MLXArray  // 父代原始缓冲(含 step 填充),子代只读 [0, forkDepth)
-    let sharedValues: MLXArray
+    struct Segment {
+        let array: MLXArray  // 父代缓冲(含 step 填充),子代只读 [0, rows)
+        let rows: Int  // 逻辑行数(≤ array.dim(2))
+    }
+    var kSegments: [Segment]
+    var vSegments: [Segment]
     let forkDepth: Int
     var privateKeys: MLXArray?
     var privateValues: MLXArray?
     var step = 256
 
-    init(parent: KVCacheSimple) {
-        guard let pk = parent.keys, let pv = parent.values else {
-            fatalError("parent has no storage")
+    init(parent: any KVCache) {
+        switch parent {
+        case let p as KVCacheSimple:
+            guard let pk = p.keys, let pv = p.values else {
+                fatalError("parent has no storage")
+            }
+            kSegments = [Segment(array: pk, rows: p.offset)]
+            vSegments = [Segment(array: pv, rows: p.offset)]
+            forkDepth = p.offset
+        case let p as COWForkKVCache:
+            kSegments = p.kSegments
+            vSegments = p.vSegments
+            // 父代私有尾部作为只读段共享:逻辑行 = 父代已用行;父代续写
+            // [used, ...) 与本段逻辑行不相交,父代增长拼接换新缓冲不回写
+            if let pk = p.privateKeys, let pv = p.privateValues {
+                kSegments.append(Segment(array: pk, rows: p.usedPrivateRows))
+                vSegments.append(Segment(array: pv, rows: p.usedPrivateRows))
+            }
+            forkDepth = p.offset
+        default:
+            fatalError("COWForkKVCache: unsupported parent \(type(of: parent))")
         }
-        self.sharedKeys = pk
-        self.sharedValues = pv
-        self.forkDepth = parent.offset
         super.init()
-        self.offset = parent.offset
+        offset = forkDepth
+    }
+
+    /// 共享前缀逻辑行数(应恒等于 forkDepth)
+    var sharedRows: Int { kSegments.map(\.rows).reduce(0, +) }
+
+    private func currentView() -> (MLXArray, MLXArray) {
+        var kParts = kSegments.map { $0.array[.ellipsis, ..<$0.rows, 0...] }
+        var vParts = vSegments.map { $0.array[.ellipsis, ..<$0.rows, 0...] }
+        if let pk = privateKeys, let pv = privateValues {
+            let used = offset - forkDepth
+            kParts.append(pk[.ellipsis, ..<used, 0...])
+            vParts.append(pv[.ellipsis, ..<used, 0...])
+        }
+        if kParts.count == 1 {
+            return (kParts[0], vParts[0])
+        }
+        return (concatenated(kParts, axis: 2), concatenated(vParts, axis: 2))
     }
 
     override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
@@ -80,23 +118,20 @@ final class COWForkKVCache: BaseKVCache {
         let used = offset - forkDepth
         privateKeys?[.ellipsis, previous..<used, 0...] = keys
         privateValues?[.ellipsis, previous..<used, 0...] = values
+        return currentView()
+    }
 
-        if let pk = privateKeys, let pv = privateValues {
-            return (
-                concatenated([
-                    sharedKeys[.ellipsis, ..<forkDepth, 0...],
-                    pk[.ellipsis, ..<used, 0...],
-                ], axis: 2),
-                concatenated([
-                    sharedValues[.ellipsis, ..<forkDepth, 0...],
-                    pv[.ellipsis, ..<used, 0...],
-                ], axis: 2)
-            )
+    /// 全视图(段表 + 私有尾),供快照/恢复路径读取。
+    /// 探针不支持整体 setter(全量回灌语义 = 磁盘 fork v1,正是要超越的路径);
+    /// 页恢复走 F3 R2 的私有页重挂。
+    override var state: [MLXArray] {
+        get {
+            let (k, v) = currentView()
+            return [k, v]
         }
-        return (
-            sharedKeys[.ellipsis, ..<forkDepth, 0...],
-            sharedValues[.ellipsis, ..<forkDepth, 0...]
-        )
+        set {
+            fatalError("COWForkKVCache.state setter not supported in probe; use page restore (F3 R2)")
+        }
     }
 
     override var isTrimmable: Bool { false }
