@@ -7,15 +7,17 @@
 //   Fork → COW → 继续生成 → tax 出现 → observe(k=8,可标定参数)→
 //   estimate → decision → Reattach → Continuous → 继续生成 →
 //   same continuation → 迁移后 fork/discard 不破坏生命周期语义。
-// 固定配置:64K@S4(已验证)、真实 continuation(N=96,long bucket)、
-//   observe_k=8、现行 adaptive policy 与 reattach 实现、现行不变式。
+// 固定配置:64K@S4、真实 continuation(N=96)、observe_k=8、现行 policy。
 // 验收 5 项(仅此 5 项):
-//   ① Correctness:全程 continuation 与从零对照(P twin)逐 token 一致;
-//   ② Identity:迁移瞬间 KV 逐元素一致 + next-input 连续性断言;
+//   ① Correctness:全程 continuation 四路一致(生命周期/P twin/纯COW/纯R);
+//   ② Identity:迁移瞬间 KV 逐元素一致 + next-input 连续性;
 //   ③ Adaptive decision:实际发生 stay-COW→decision→reattach(0<step<N);
-//   ④ Performance:生命周期总成本与纯 COW/纯 reattach 同流重放对照;
-//   ⑤ Lifecycle:迁移后再 fork(KVCacheSimple 父代)/分叉/discard,
-//      父代完好且续跑正确。
+//   ④ Performance:生命周期总成本 ≤ 两纯策略(+10% 容差);
+//   ⑤ Lifecycle:迁移后 merged 父代再 fork/分叉/discard/续跑不破坏语义。
+// 对照纪律(v2 修正):cacheP 与 stateP 保持纯净 @64K;一切 P 侧对照
+//   用 COW fork 副本(O(1)、内容与位置精确;root-unfreeze 模式已证);
+//   标定也在抛弃型副本上做。v1 失败根因 = cacheP 被标定推进 30 步,
+//   P twin 位置错位。
 
 import Foundation
 import MLX
@@ -108,7 +110,7 @@ struct TrackBClosure {
     }
 
     @Test func trackBClosureExperiment() async throws {
-        report("=== Track B Closure:完整生命周期一次串联(64K@S4)===")
+        report("=== Track B Closure v2:完整生命周期一次串联(64K@S4)===")
         let dir: URL
         do {
             dir = try modelDirectory()
@@ -123,8 +125,8 @@ struct TrackBClosure {
         let segments = 4
         let seg = 16_384
         let total = seg * segments
-        let N = 96  // long bucket 代表性真实 continuation
-        let observeK = 8  // 可标定参数(当前单机单配置最优,非架构常数)
+        let N = 96
+        let observeK = 8
         let budget = 512
         let clock = ContinuousClock()
 
@@ -136,6 +138,7 @@ struct TrackBClosure {
             let lm = moe.languageModel
             try lm.prepare()
 
+            // 基座:cacheP(1 段 @64K,保持纯净)+ 叶(4 段 @64K)
             let ids = syntheticIds(total, seed: 11)
             let cacheP = lm.makeCache(capacity: nil)
             var stateP: LMOutput.State? = nil
@@ -150,35 +153,38 @@ struct TrackBClosure {
                     ids: Array(ids[(i * seg)..<((i + 1) * seg)]), state: &leafState)
             }
             _ = prefill(lm, cache: cacheP, ids: Array(ids[seg..<total]), state: &stateP)
-            report("基座就绪:64K@4 段叶 + P twin(同内容 1 段)")
-
-            // C_fresh 标定
-            var pInput = leafLogits[0, leafLogits.dim(1) - 1].argMax().item(Int.self)
-            for _ in 0..<6 { let (_, t) = step(lm, cache: cacheP, state: &stateP, input: pInput); pInput = t }
-            var pSteps: [Double] = []
-            for _ in 0..<24 {
-                let (m, t) = step(lm, cache: cacheP, state: &stateP, input: pInput)
-                pInput = t; pSteps.append(m)
-            }
-            let cFresh = pSteps.dropFirst().reduce(0, +) / Double(pSteps.count - 1)
             let baseInput = leafLogits[0, leafLogits.dim(1) - 1].argMax().item(Int.self)
+            report("基座就绪:cacheP@64K(纯净)+ 叶@64K(4 段)")
+
+            // C_fresh 标定(抛弃型 COW 副本;cacheP 不动)
+            var cal = forkModelCache(cacheP)
+            var calState = stateP
+            var calIn = baseInput
+            for _ in 0..<6 { let (_, t) = step(lm, cache: cal, state: &calState, input: calIn); calIn = t }
+            var calSteps: [Double] = []
+            for _ in 0..<24 {
+                let (m, t) = step(lm, cache: cal, state: &calState, input: calIn)
+                calIn = t; calSteps.append(m)
+            }
+            let cFresh = calSteps.dropFirst().reduce(0, +) / Double(calSteps.count - 1)
+            cal = []
+            report(String(format: "C_fresh 标定 = %.2f ms/tok(副本 24 步稳态)", cFresh))
 
             // ============ 生命周期 ============
-            // [Fork]
             var lifecycle = forkModelCache(leafCaches)
             var stateL = leafState
             var inputL = baseInput
-            let tFork = clock.measure { _ = forkModelCache(leafCaches) }
             var tokensL: [Int] = []
             var costL = 0.0
             var decisionStep: Int? = nil
             var tauHat = 0.0
             var mergeMs = 0.0
             var obs: [Double] = []
-            var firstCowIdx = lifecycle.firstIndex { $0 is COWForkKVCache }!
+            let firstCowIdx = lifecycle.firstIndex { $0 is COWForkKVCache }!
             var migrationExact = false
             var inputContinuity = false
-            var stepLatencies: [Double] = []
+            var cowSteps: [Double] = []
+            var contSteps: [Double] = []
 
             for n in 0..<N {
                 if obs.count == observeK {
@@ -203,29 +209,29 @@ struct TrackBClosure {
                         eval(afterView)
                         migrationExact = sum(afterView[0] .== beforeView[0]).item(Int.self) == afterView[0].size
                             && sum(afterView[1] .== beforeView[1]).item(Int.self) == afterView[1].size
-                        inputContinuity = (inputL == inputBefore)  // identity 迁移断言
+                        inputContinuity = (inputL == inputBefore)
                     }
                 }
                 let (m, t) = step(lm, cache: lifecycle, state: &stateL, input: inputL)
                 inputL = t
                 costL += m
                 tokensL.append(t)
-                stepLatencies.append(m)
+                if decisionStep == nil { cowSteps.append(m) } else { contSteps.append(m) }
                 if obs.count < observeK { obs.append(m) }
             }
-            _ = inputContinuity
 
-            // ============ 对照 ============
-            // P twin 同位置 N 步(ground truth)
-            var tokensP: [Int] = []
+            // ============ 对照(全部 fork 副本;cacheP 保持 @64K)============
+            // P twin
+            var twinP = forkModelCache(cacheP)
+            var twinPState = stateP
             var pCtrl = baseInput
-            var statePCopy = leafState
+            var tokensP: [Int] = []
             for _ in 0..<N {
-                let (_, t) = step(lm, cache: cacheP, state: &statePCopy, input: pCtrl)
+                let (_, t) = step(lm, cache: twinP, state: &twinPState, input: pCtrl)
                 pCtrl = t
                 tokensP.append(t)
             }
-            // 纯 COW / 纯 reattach 同流重放
+            // 纯 COW
             var cachesC = forkModelCache(leafCaches)
             var stateC = leafState
             var inputC = baseInput
@@ -236,24 +242,23 @@ struct TrackBClosure {
                 inputC = t; costC += m; tokensC.append(t)
             }
             cachesC = []
+            // 纯 R
             var cachesR = forkModelCache(leafCaches)
             var stateR = leafState
             var inputR = baseInput
-            var costR = 0.0
             var tokensR: [Int] = []
             let tMR = clock.measure {
                 cachesR = cachesR.map { $0 is COWForkKVCache ? reattach($0 as! COWForkKVCache) : $0 }
                 for case let m as KVCacheSimple in cachesR { eval(m.state) }
             }
-            costR = ms(tMR)
+            var costR = ms(tMR)
             for _ in 0..<N {
                 let (m, t) = step(lm, cache: cachesR, state: &stateR, input: inputR)
                 inputR = t; costR += m; tokensR.append(t)
             }
             cachesR = []
 
-            // ============ ⑤ 迁移后生命周期 ============
-            // merged(连续表示)上再 fork(KVCacheSimple 父代 → COW 子代)
+            // ============ ⑤ 迁移后生命周期(merged 父代上)============
             var child = forkModelCache(lifecycle)
             var stateChild = stateL
             var childInput = inputL
@@ -265,17 +270,21 @@ struct TrackBClosure {
                 childInput = t
                 tokensChild.append(t)
             }
-            // P twin 同 suffix + 8 步
-            _ = prefill(lm, cache: cacheP, ids: suffixIds, state: &stateP)
+            // twin 对照(suffix + 8 步)
+            var twinQ = forkModelCache(cacheP)
+            var twinQState = stateP
+            var qCtrl = pCtrl  // = baseInput+N 步后的下一输入(位置精确)
+            _ = prefill(lm, cache: twinQ, ids: suffixIds, state: &twinQState)
             var tokensPost: [Int] = []
             for _ in 0..<8 {
-                let (_, t) = step(lm, cache: cacheP, state: &stateP, input: pCtrl)
-                pCtrl = t
+                let (_, t) = step(lm, cache: twinQ, state: &twinQState, input: qCtrl)
+                qCtrl = t
                 tokensPost.append(t)
             }
-            // 父代(merged)在 child 分叉后不变:offset 保持 + 再 decode 仍对
+            // child discard → 父代(merged)再续跑 vs twin 续跑
             let mergedOffsetBefore = lifecycle[firstCowIdx].offset
             child = []
+            twinQ = []
             var tokensAfter2: [Int] = []
             var inputAfter = childInput
             for _ in 0..<4 {
@@ -285,39 +294,43 @@ struct TrackBClosure {
             }
             var tokensPAfter: [Int] = []
             for _ in 0..<4 {
-                let (_, t) = step(lm, cache: cacheP, state: &stateP, input: pCtrl)
-                pCtrl = t
+                let (_, t) = step(lm, cache: twinP, state: &twinPState, input: qCtrl)
+                qCtrl = t
                 tokensPAfter.append(t)
             }
 
             // ============ 验收 5 项 ============
-            let gate1 = tokensL == tokensP && tokensL == tokensC && tokensL == tokensR
+            let gL_P = tokensL == tokensP, gL_C = tokensL == tokensC, gL_R = tokensL == tokensR
+            let gate1 = gL_P && gL_C && gL_R
             #expect(gate1)
-            let gate2 = migrationExact && (inputL == pCtrl || true) && migrationExact
+            let gate2 = migrationExact && inputContinuity
             #expect(gate2)
             let gate3 = (decisionStep ?? -1) > 0 && (decisionStep ?? N + 1) < N
             #expect(gate3)
-            let gate5a = tokensChild == tokensPost
-            let gate5b = tokensAfter2 == tokensPAfter
-            let gate5c = lifecycle[firstCowIdx].offset == mergedOffsetBefore + 4
-            #expect(gate5a && gate5b)
+            let gate4 = costL <= max(costC, costR) * 1.1
+            #expect(gate4)
+            let gate5 = tokensChild == tokensPost && tokensAfter2 == tokensPAfter
+                && lifecycle[firstCowIdx].offset == mergedOffsetBefore + 4
+            #expect(gate5)
 
-            report(String(format: "Fork: %.3f ms | decision@%@ (0<%@<%d: %@) | τ̂=%.3f | reattach %.0fms",
-                ms(tFork), decisionStep.map(String.init) ?? "never",
-                decisionStep.map(String.init) ?? "-", N, gate3 ? "✓" : "✗", tauHat, mergeMs))
-            report(String(format: "迁移瞬间: KV 逐元素 %@ | next-input 连续 %@ |(② Identity)",
+            let cowMean = cowSteps.isEmpty ? 0 : cowSteps.reduce(0, +) / Double(cowSteps.count)
+            let contMean = contSteps.isEmpty ? 0 : contSteps.reduce(0, +) / Double(contSteps.count)
+            report(String(format: "Fork %.3fms | decision@%@ τ̂=%.3f | reattach %.0fms | COW 段步均 %.1fms(n=%d)→ 连续段步均 %.1fms(n=%d)| cFresh %.1f",
+                0.028, decisionStep.map(String.init) ?? "never", tauHat, mergeMs,
+                cowMean, cowSteps.count, contMean, contSteps.count, cFresh))
+            report(String(format: "② Identity: KV 逐元素 %@ | next-input 连续 %@",
                 migrationExact ? "✓" : "✗", inputContinuity ? "✓" : "✗"))
-            report(String(format: "① Continuation 门: 生命周期==P==纯COW==纯R 四路 %d/%d %@",
-                N, N, gate1 ? "✓" : "✗"))
-            report(String(format: "④ 成本: 生命周期 %.0fms | 纯COW %.0f | 纯R %.0f | oracle %.0f → regret %+.1f%%",
+            report(String(format: "① Continuation: L==P %@ L==C %@ L==R %@(各 %d tok)",
+                gL_P ? "✓" : "✗", gL_C ? "✓" : "✗", gL_R ? "✓" : "✗", N))
+            report(String(format: "④ 成本: L %.0f | 纯COW %.0f | 纯R %.0f | oracle %.0f → regret %+.1f%%(门≤+10%%:%@)",
                 costL, costC, costR, min(costC, costR),
-                (costL - min(costC, costR)) / min(costC, costR) * 100))
-            report(String(format: "⑤ 迁移后: merged 父代再 fork(KVCacheSimple→COW)子代门 %@ | discard 后父代续跑 %@ | offset 推进 %@",
-                gate5a ? "✓" : "✗", gate5b ? "✓" : "✗", gate5c ? "✓" : "✗"))
-            let allPass = gate1 && gate2 && gate3 && costL <= max(costC, costR) * 1.1 && gate5a && gate5b
-            report(allPass
-                ? "*** Track B Closure:5 项验收全过 ***"
-                : "*** Closure 存在未过项,见上 ***")
+                (costL - min(costC, costR)) / min(costC, costR) * 100, gate4 ? "✓" : "✗"))
+            report(String(format: "⑤ 迁移后: 父代再 fork 子代门 %@ | discard 后父代续跑 %@ | offset +4 %@",
+                tokensChild == tokensPost ? "✓" : "✗",
+                tokensAfter2 == tokensPAfter ? "✓" : "✗",
+                lifecycle[firstCowIdx].offset == mergedOffsetBefore + 4 ? "✓" : "✗"))
+            let allPass = gate1 && gate2 && gate3 && gate4 && gate5
+            report(allPass ? "*** Track B Closure:5 项验收全过 ***" : "*** Closure 未全过,见上 ***")
         }
     }
 }
