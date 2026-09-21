@@ -272,14 +272,23 @@ struct TrackBClosure {
             }
             cachesR = []
 
-            // ============ ⑤ 迁移后生命周期(v3:双分支同位对照)============
-            // 审计修复 G5:lifecycle 与 twinP 同位于 64K+96(gate1 已证
-            // L==P)。两侧做完全同形的分支实验:fork child → suffix(64,
-            // teacher-forced)→ 8 自由步 → discard → 父代从各自 child 的
-            // next-input 续 4 步。每一处对照两侧位置/输入精确对齐。
+            // ============ ⑤ 迁移后生命周期(v4:discard 语义修正)============
+            // 审计修复 G5-v4:v3 让父代使用 discarded child 的 next-input
+            // ("旧 parent state + 新 child input"= 非法 execution state;
+            // 那是 adopt 语义,代码却只做了 discard)。discard 语义 =
+            // **父代不受 child 存在影响,从 fork 前自身 next-input 继续**:
+            // fork → child speculative work → discard → parent intact →
+            // parent continues。双分支两侧完全同构、同位。
             let suffixIds = syntheticIds(64, seed: 21)
 
-            // lifecycle 侧 child 分支
+            // fork 前保存父代自身的 next-input(discard 语义的关键)
+            let parentInputBeforeFork = inputL       // lifecycle @64K+96
+            let twinParentInputBeforeFork = pCtrl    // twinP @64K+96
+            // 可证伪:两侧 parent next-input 独立产生(gate1 已证 L==P),必须一致
+            let parentInputsAgree = parentInputBeforeFork == twinParentInputBeforeFork
+            #expect(parentInputsAgree)
+
+            // lifecycle 侧 child 分支(speculative work)
             var child = forkModelCache(lifecycle)  // @64K+96
             var stateChild = stateL
             let childLogits = prefill(lm, cache: child, ids: suffixIds, state: &stateChild)
@@ -310,12 +319,12 @@ struct TrackBClosure {
             let branchBoundaryOK = childBranchInput == twinBranchInput
             #expect(branchBoundaryOK)
 
-            // discard 双 child;双侧父代从各自 child 的 next-input 继续
-            // (位置 64K+96+64+8,对齐)
+            // discard 双 child → 父代不受影响,从 **fork 前自身 next-input**
+            // 继续 4 步(位置 64K+96 → 64K+100;非 child 的 next-input)
             let mergedOffsetBefore = lifecycle[firstCowIdx].offset
             child = []
             twinChild = []
-            var inputAfter = childNext
+            var inputAfter = parentInputBeforeFork
             var tokensAfter2: [Int] = []
             for _ in 0..<4 {
                 let (_, t) = step(lm, cache: lifecycle, state: &stateL, input: inputAfter)
@@ -323,7 +332,7 @@ struct TrackBClosure {
                 tokensAfter2.append(t)
             }
             var tokensPAfter: [Int] = []
-            var twinPAfterInput = twinNext
+            var twinPAfterInput = twinParentInputBeforeFork
             for _ in 0..<4 {
                 let (_, t) = step(lm, cache: twinP, state: &twinPState, input: twinPAfterInput)
                 twinPAfterInput = t
@@ -357,9 +366,10 @@ struct TrackBClosure {
             report(String(format: "④ 成本: L %.0f | 纯COW %.0f | 纯R %.0f | oracle %.0f → regret %+.1f%%(门≤+10%%:%@)",
                 costL, costC, costR, min(costC, costR),
                 (costL - min(costC, costR)) / min(costC, costR) * 100, gate4 ? "✓" : "✗"))
-            report(String(format: "⑤ 迁移后(双分支同位): child 门 %@ | 分支边界输入一致 %@ | discard 后父代续跑 %@ | offset +4 %@",
+            report(String(format: "⑤ 迁移后(discard 语义): child 门 %@ | 分支边界输入一致 %@ | 父代 next-input 一致 %@ | discard 后父代从自身 next-input 续跑 %@ | offset +4 %@",
                 tokensChild == tokensPost ? "✓" : "✗",
                 branchBoundaryOK ? "✓" : "✗",
+                parentInputsAgree ? "✓" : "✗",
                 tokensAfter2 == tokensPAfter ? "✓" : "✗",
                 lifecycle[firstCowIdx].offset == mergedOffsetBefore + 4 ? "✓" : "✗"))
             let allPass = gate1 && gate2 && gate3 && gate4 && gate5
