@@ -88,6 +88,20 @@ struct TrackBClosure {
         return merged
     }
 
+    /// 迁移作为可测单元(G2 审计修复):表示(COW→连续)与 execution
+    /// state(cache/state/next-input)作为一个三元组整体搬运;契约 =
+    /// identity 不变。v1 harness 的 mInput 丢失 bug 正是本单元要拦的
+    /// 类别——下游 step 消费的是迁移单元带回的 input,而非环境变量。
+    private func migrate(
+        _ caches: [KVCache], _ state: LMOutput.State?, _ nextInput: Int
+    ) -> ([KVCache], LMOutput.State?, Int) {
+        let migrated = caches.map {
+            $0 is COWForkKVCache ? reattach($0 as! COWForkKVCache) : $0
+        }
+        for case let m as KVCacheSimple in migrated { eval(m.state) }
+        return (migrated, state, nextInput)
+    }
+
     private func step(
         _ lm: Qwen35Language.LanguageModel,
         cache: [KVCache],
@@ -196,12 +210,9 @@ struct TrackBClosure {
                         decisionStep = n
                         let beforeView = (lifecycle[firstCowIdx] as! COWForkKVCache).state
                         eval(beforeView)
-                        let inputBefore = inputL
+                        let boundaryInput = inputL  // 迁移前确定的 next-input
                         let t = clock.measure {
-                            lifecycle = lifecycle.map {
-                                $0 is COWForkKVCache ? reattach($0 as! COWForkKVCache) : $0
-                            }
-                            for case let m as KVCacheSimple in lifecycle { eval(m.state) }
+                            (lifecycle, stateL, inputL) = self.migrate(lifecycle, stateL, inputL)
                         }
                         mergeMs = ms(t)
                         costL += mergeMs
@@ -209,7 +220,10 @@ struct TrackBClosure {
                         eval(afterView)
                         migrationExact = sum(afterView[0] .== beforeView[0]).item(Int.self) == afterView[0].size
                             && sum(afterView[1] .== beforeView[1]).item(Int.self) == afterView[1].size
-                        inputContinuity = (inputL == inputBefore)
+                        // G2(审计修复):断言迁移单元的契约——下游消费的
+                        // 是 migrate 带回的 input;若迁移丢弃/改写 identity
+                        // (mInput bug 类别),此处与 continuation 门同时失败
+                        inputContinuity = (inputL == boundaryInput)
                     }
                 }
                 let (m, t) = step(lm, cache: lifecycle, state: &stateL, input: inputL)
@@ -258,44 +272,61 @@ struct TrackBClosure {
             }
             cachesR = []
 
-            // ============ ⑤ 迁移后生命周期(merged 父代上)============
-            var child = forkModelCache(lifecycle)
-            var stateChild = stateL
-            var childInput = inputL
+            // ============ ⑤ 迁移后生命周期(v3:双分支同位对照)============
+            // 审计修复 G5:lifecycle 与 twinP 同位于 64K+96(gate1 已证
+            // L==P)。两侧做完全同形的分支实验:fork child → suffix(64,
+            // teacher-forced)→ 8 自由步 → discard → 父代从各自 child 的
+            // next-input 续 4 步。每一处对照两侧位置/输入精确对齐。
             let suffixIds = syntheticIds(64, seed: 21)
-            _ = prefill(lm, cache: child, ids: suffixIds, state: &stateChild)
+
+            // lifecycle 侧 child 分支
+            var child = forkModelCache(lifecycle)  // @64K+96
+            var stateChild = stateL
+            let childLogits = prefill(lm, cache: child, ids: suffixIds, state: &stateChild)
+            let childBranchInput = childLogits[0, childLogits.dim(1) - 1]
+                .argMax().item(Int.self)  // 分支边界 next-input = prefill 末 argmax
+            var childNext = childBranchInput
             var tokensChild: [Int] = []
             for _ in 0..<8 {
-                let (_, t) = step(lm, cache: child, state: &stateChild, input: childInput)
-                childInput = t
+                let (_, t) = step(lm, cache: child, state: &stateChild, input: childNext)
+                childNext = t
                 tokensChild.append(t)
             }
-            // twin 对照(suffix + 8 步)
-            var twinQ = forkModelCache(cacheP)
-            var twinQState = stateP
-            var qCtrl = pCtrl  // = baseInput+N 步后的下一输入(位置精确)
-            _ = prefill(lm, cache: twinQ, ids: suffixIds, state: &twinQState)
+
+            // P 侧 twin child 分支(同形、同位)
+            var twinChild = forkModelCache(twinP)  // @64K+96
+            var twinChildState = twinPState
+            let twinChildLogits = prefill(lm, cache: twinChild, ids: suffixIds, state: &twinChildState)
+            let twinBranchInput = twinChildLogits[0, twinChildLogits.dim(1) - 1]
+                .argMax().item(Int.self)
+            var twinNext = twinBranchInput
             var tokensPost: [Int] = []
             for _ in 0..<8 {
-                let (_, t) = step(lm, cache: twinQ, state: &twinQState, input: qCtrl)
-                qCtrl = t
+                let (_, t) = step(lm, cache: twinChild, state: &twinChildState, input: twinNext)
+                twinNext = t
                 tokensPost.append(t)
             }
-            // child discard → 父代(merged)再续跑 vs twin 续跑
+            // 可证伪的边界一致性:两侧分支边界输入独立产生,必须一致
+            let branchBoundaryOK = childBranchInput == twinBranchInput
+            #expect(branchBoundaryOK)
+
+            // discard 双 child;双侧父代从各自 child 的 next-input 继续
+            // (位置 64K+96+64+8,对齐)
             let mergedOffsetBefore = lifecycle[firstCowIdx].offset
             child = []
-            twinQ = []
+            twinChild = []
+            var inputAfter = childNext
             var tokensAfter2: [Int] = []
-            var inputAfter = childInput
             for _ in 0..<4 {
                 let (_, t) = step(lm, cache: lifecycle, state: &stateL, input: inputAfter)
                 inputAfter = t
                 tokensAfter2.append(t)
             }
             var tokensPAfter: [Int] = []
+            var twinPAfterInput = twinNext
             for _ in 0..<4 {
-                let (_, t) = step(lm, cache: twinP, state: &twinPState, input: qCtrl)
-                qCtrl = t
+                let (_, t) = step(lm, cache: twinP, state: &twinPState, input: twinPAfterInput)
+                twinPAfterInput = t
                 tokensPAfter.append(t)
             }
 
@@ -309,7 +340,8 @@ struct TrackBClosure {
             #expect(gate3)
             let gate4 = costL <= max(costC, costR) * 1.1
             #expect(gate4)
-            let gate5 = tokensChild == tokensPost && tokensAfter2 == tokensPAfter
+            let gate5 = tokensChild == tokensPost && branchBoundaryOK
+                && tokensAfter2 == tokensPAfter
                 && lifecycle[firstCowIdx].offset == mergedOffsetBefore + 4
             #expect(gate5)
 
@@ -325,8 +357,9 @@ struct TrackBClosure {
             report(String(format: "④ 成本: L %.0f | 纯COW %.0f | 纯R %.0f | oracle %.0f → regret %+.1f%%(门≤+10%%:%@)",
                 costL, costC, costR, min(costC, costR),
                 (costL - min(costC, costR)) / min(costC, costR) * 100, gate4 ? "✓" : "✗"))
-            report(String(format: "⑤ 迁移后: 父代再 fork 子代门 %@ | discard 后父代续跑 %@ | offset +4 %@",
+            report(String(format: "⑤ 迁移后(双分支同位): child 门 %@ | 分支边界输入一致 %@ | discard 后父代续跑 %@ | offset +4 %@",
                 tokensChild == tokensPost ? "✓" : "✗",
+                branchBoundaryOK ? "✓" : "✗",
                 tokensAfter2 == tokensPAfter ? "✓" : "✗",
                 lifecycle[firstCowIdx].offset == mergedOffsetBefore + 4 ? "✓" : "✗"))
             let allPass = gate1 && gate2 && gate3 && gate4 && gate5
