@@ -949,6 +949,40 @@ public class Qwen35TextModelInner: Module {
         return applyFinalNorm ? norm(hiddenStates) : hiddenStates
     }
 
+    /// Execute ONLY `layerRange` of the decoder stack.
+    ///
+    /// Input is already-embedded hidden states (the caller embeds separately).
+    /// `applyFinalNorm` defaults to `false` so chained segment calls do not
+    /// prematurely normalize; the final call in a chain (or the caller's
+    /// `projectOutput`) applies the norm.
+    func forwardLayerRange(
+        _ hiddenStates: MLXArray,
+        layerRange: Range<Int>,
+        cache: [KVCache?]? = nil,
+        applyFinalNorm: Bool = false
+    ) -> MLXArray {
+        var current = hiddenStates
+
+        var cacheArray = cache
+        if cacheArray == nil {
+            cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
+        }
+        let faMask = createAttentionMask(h: current, cache: cacheArray?[faIdx])
+        let ssmMask = createSSMMask(h: current, cache: cacheArray?[ssmIdx] as? MambaCache)
+
+        for i in layerRange {
+            let layer = layers[i]
+            let mask = layer.isLinear ? ssmMask : nil
+            let attnMask =
+                layer.isLinear
+                ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+            current = layer(
+                current, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+        }
+
+        return applyFinalNorm ? norm(current) : current
+    }
+
     // MARK: - Whole-step decode schedule
 
     /// One traced piece of a decode step: the tail of the previous
@@ -1277,6 +1311,36 @@ public class Qwen35Model: Module, LLMModel, KVCacheDimensionProvider {
 extension Qwen35Model: LoRAModel {
     public var loraLayers: [Module] {
         languageModel.model.layers
+    }
+}
+
+// MARK: - SimiGo Runtime segment-execution surface (O3-C″ Backend API)
+
+extension Qwen35Model {
+    /// Embed token inputs (segment streaming step 1).
+    public func embedInputs(_ tokenIDs: MLXArray) -> MLXArray {
+        languageModel.model.embedTokens(tokenIDs)
+    }
+
+    /// Execute ONLY `layerRange` of the decoder stack (segment streaming
+    /// step 2). Physical execution slice only — Execution State semantics
+    /// remain in the SimiGo Runtime.
+    public func forwardLayerRange(
+        _ hiddenStates: MLXArray,
+        layerRange: Range<Int>,
+        cache: [KVCache?]? = nil
+    ) -> MLXArray {
+        languageModel.model.forwardLayerRange(
+            hiddenStates, layerRange: layerRange, cache: cache)
+    }
+
+    /// Final norm + LM head projection (segment streaming step 3).
+    public func projectOutput(_ hiddenStates: MLXArray) -> MLXArray {
+        let normed = languageModel.model.norm(hiddenStates)
+        if let lmHead = languageModel.lmHead {
+            return lmHead(normed)
+        }
+        return normed
     }
 }
 
