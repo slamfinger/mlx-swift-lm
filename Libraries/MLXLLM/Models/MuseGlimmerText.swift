@@ -10,7 +10,7 @@ import MLX
 import MLXLMCommon
 import MLXNN
 
-public struct MuseGlimmerTextLLMConfiguration: Codable, Sendable {
+public struct MuseGlimmerTextLLMConfiguration: Decodable, Sendable {
     public let modelType: String
     public let vocabularySize: Int
     public let hiddenSize: Int
@@ -31,10 +31,14 @@ public struct MuseGlimmerTextLLMConfiguration: Codable, Sendable {
     public let layerTypes: [String]
     public let layerRopeTheta: [Float]
     public let ropeParameters: [String: StringOrNumber]?
+    public let packagedMLXFormat: Int?
 
     var ropeTheta: Float {
         ropeParameters?["rope_theta"]?.asFloat() ?? 500_000
     }
+
+    var usesPackagedMLXFormat: Bool { packagedMLXFormat == 1 }
+    var usesAttentionOutputGate: Bool { usesPackagedMLXFormat }
 
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
@@ -57,6 +61,7 @@ public struct MuseGlimmerTextLLMConfiguration: Codable, Sendable {
         case layerTypes = "layer_types"
         case layerRopeTheta = "layer_rope_theta"
         case ropeParameters = "rope_parameters"
+        case museGlimmerMLXFormat = "muse_glimmer_mlx_format"
     }
 
     public init(from decoder: Decoder) throws {
@@ -84,6 +89,8 @@ public struct MuseGlimmerTextLLMConfiguration: Codable, Sendable {
         tieWordEmbeddings = try c.decodeIfPresent(Bool.self, forKey: .tieWordEmbeddings) ?? false
         ropeParameters = try c.decodeIfPresent(
             [String: StringOrNumber].self, forKey: .ropeParameters)
+        packagedMLXFormat = try c.decodeIfPresent(Int.self, forKey: .museGlimmerMLXFormat)
+
 
         let hiddenLayerCount = hiddenLayers
         let defaultRopeTheta =
@@ -109,6 +116,7 @@ public struct MuseGlimmerTextLLMConfiguration: Codable, Sendable {
         layerTypes = resolvedLayerTypes
         layerRopeTheta = resolvedLayerRopeTheta
     }
+
 }
 
 final class MuseGlimmerTextLLMRMSNormNoScale: Module, UnaryLayer {
@@ -127,15 +135,36 @@ final class MuseGlimmerTextLLMRMSNormNoScale: Module, UnaryLayer {
 final class MuseGlimmerTextLLMCenteredRMSNorm: Module, UnaryLayer {
     @ModuleInfo var weight: MLXArray
     let eps: Float
+    let usesOffsetWeights: Bool
 
-    init(dimensions: Int, eps: Float) {
+    init(dimensions: Int, eps: Float, usesOffsetWeights: Bool = true) {
+        self.usesOffsetWeights = usesOffsetWeights
         self._weight.wrappedValue = MLXArray.zeros([dimensions])
         self.eps = eps
         super.init()
     }
 
     func callAsFunction(_ x: MLXArray) -> MLXArray {
-        MLXFast.rmsNorm(x, weight: 1 + weight, eps: eps)
+        if usesOffsetWeights {
+            MLXFast.rmsNorm(x, weight: 1 + weight, eps: eps)
+        } else {
+            MLXFast.rmsNorm(x, weight: weight, eps: eps)
+        }
+    }
+}
+
+final class MuseGlimmerTextLLMPlainRMSNorm: Module, UnaryLayer {
+    @ModuleInfo var weight: MLXArray
+    let eps: Float
+
+    init(dimensions: Int, eps: Float) {
+        self._weight.wrappedValue = MLXArray.ones([dimensions])
+        self.eps = eps
+        super.init()
+    }
+
+    func callAsFunction(_ x: MLXArray) -> MLXArray {
+        MLXFast.rmsNorm(x, weight: weight, eps: eps)
     }
 }
 
@@ -162,7 +191,7 @@ final class MuseGlimmerTextLLMAttention: Module {
     @ModuleInfo(key: "v_proj") var valueProj: Linear
     @ModuleInfo(key: "o_proj") var outputProj: Linear
 
-    @ModuleInfo(key: "gate_proj") var gateProj: Linear
+    @ModuleInfo(key: "gate_proj") var gateProj: Linear?
     @ModuleInfo(key: "qk_norm") var qkNorm: MuseGlimmerTextLLMRMSNormNoScale
     @ModuleInfo var rope: RoPELayer
 
@@ -171,15 +200,20 @@ final class MuseGlimmerTextLLMAttention: Module {
     let headDim: Int
     let scale: Float
     let qkScaleFactor: Float
+    let usesDirectQKScale: Bool
     let useRope: Bool
     let isSliding: Bool
+    let usesFusedOutputGate: Bool
 
     init(_ config: MuseGlimmerTextLLMConfiguration, layerIndex: Int) {
         attentionHeads = config.attentionHeads
         kvHeads = config.kvHeads
         headDim = config.headDim
-        scale = pow(Float(config.headDim), -0.5)
         qkScaleFactor = config.qkScaleFactor
+        usesDirectQKScale = config.usesPackagedMLXFormat
+        scale = usesDirectQKScale
+            ? config.qkScaleFactor / Float(config.headDim)
+            : pow(Float(config.headDim), -0.5)
 
         let theta = config.layerRopeTheta[layerIndex]
         useRope = theta != 0
@@ -187,11 +221,16 @@ final class MuseGlimmerTextLLMAttention: Module {
 
         let queryDim = config.attentionHeads * config.headDim
         let kvDim = config.kvHeads * config.headDim
+        usesFusedOutputGate = config.usesAttentionOutputGate
         _queryProj.wrappedValue = Linear(
-            config.hiddenSize, queryDim, bias: config.attentionBias)
+            config.hiddenSize,
+            usesFusedOutputGate ? 2 * queryDim : queryDim,
+            bias: config.attentionBias)
         _keyProj.wrappedValue = Linear(config.hiddenSize, kvDim, bias: config.attentionBias)
         _valueProj.wrappedValue = Linear(config.hiddenSize, kvDim, bias: config.attentionBias)
-        _gateProj.wrappedValue = Linear(config.hiddenSize, queryDim, bias: false)
+        if !usesFusedOutputGate {
+            _gateProj.wrappedValue = Linear(config.hiddenSize, queryDim, bias: false)
+        }
         _outputProj.wrappedValue = Linear(queryDim, config.hiddenSize, bias: config.attentionBias)
         _qkNorm.wrappedValue = MuseGlimmerTextLLMRMSNormNoScale(eps: config.rmsNormEps)
 
@@ -209,12 +248,27 @@ final class MuseGlimmerTextLLMAttention: Module {
         let batch = x.dim(0)
         let length = x.dim(1)
 
-        var queries = queryProj(x).reshaped(batch, length, attentionHeads, headDim)
+        var queries = queryProj(x)
         var keys = keyProj(x).reshaped(batch, length, kvHeads, headDim)
         let values = valueProj(x).reshaped(batch, length, kvHeads, headDim)
+        var attentionGate: MLXArray?
+        if usesFusedOutputGate {
+            let split = queries
+                .reshaped(batch, length, attentionHeads, 2 * headDim)
+                .split(parts: 2, axis: -1)
+            queries = split[0]
+            attentionGate = split[1].reshaped(batch, length, -1)
+        } else {
+            queries = queries.reshaped(batch, length, attentionHeads, headDim)
+        }
 
-        queries = (qkNorm(queries) * qkScaleFactor).transposed(0, 2, 1, 3)
+        queries = qkNorm(queries)
+        if !usesDirectQKScale {
+            queries = queries * qkScaleFactor
+        }
+        queries = queries.transposed(0, 2, 1, 3)
         keys = qkNorm(keys).transposed(0, 2, 1, 3)
+
         let valuesBh = values.transposed(0, 2, 1, 3)
 
         if useRope {
@@ -230,7 +284,12 @@ final class MuseGlimmerTextLLMAttention: Module {
             scale: scale,
             mask: mask)
         output = output.transposed(0, 2, 1, 3).reshaped(batch, length, -1)
-        output = output * sigmoid(gateProj(x))
+        if let gateProj {
+            output = output * sigmoid(gateProj(x))
+        }
+        if let attentionGate {
+            output = output * sigmoid(attentionGate)
+        }
         return outputProj(output)
     }
 }
@@ -253,13 +312,17 @@ final class MuseGlimmerTextLLMBlock: Module {
         _attention.wrappedValue = MuseGlimmerTextLLMAttention(config, layerIndex: layerIndex)
         _mlp.wrappedValue = MuseGlimmerTextLLMMLP(config)
         _inputLayerNorm.wrappedValue = MuseGlimmerTextLLMCenteredRMSNorm(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+            dimensions: config.hiddenSize, eps: config.rmsNormEps,
+            usesOffsetWeights: !config.usesPackagedMLXFormat)
         _postAttentionLayerNorm.wrappedValue = MuseGlimmerTextLLMCenteredRMSNorm(
-            dimensions: config.hiddenSize, eps: config.postNormEps)
+            dimensions: config.hiddenSize, eps: config.postNormEps,
+            usesOffsetWeights: !config.usesPackagedMLXFormat)
         _preFeedforwardLayerNorm.wrappedValue = MuseGlimmerTextLLMCenteredRMSNorm(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
+            dimensions: config.hiddenSize, eps: config.rmsNormEps,
+            usesOffsetWeights: !config.usesPackagedMLXFormat)
         _postFeedforwardLayerNorm.wrappedValue = MuseGlimmerTextLLMCenteredRMSNorm(
-            dimensions: config.hiddenSize, eps: config.postNormEps)
+            dimensions: config.hiddenSize, eps: config.postNormEps,
+            usesOffsetWeights: !config.usesPackagedMLXFormat)
         isSliding = config.layerTypes[layerIndex] == "sliding_attention"
         super.init()
     }
@@ -350,7 +413,8 @@ public final class MuseGlimmerTextLLMModel: Module, LLMModel, KVCacheDimensionPr
     }
 
     public func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        var logits = model(inputs, cache: cache) * configuration.outputMultiplier
+        var logits = (model(inputs, cache: cache).asType(.float32)
+            * configuration.outputMultiplier)
         let softcapping = configuration.finalLogitSoftcapping
         if softcapping > 0 {
             logits = tanh(logits / softcapping) * softcapping
@@ -359,7 +423,12 @@ public final class MuseGlimmerTextLLMModel: Module, LLMModel, KVCacheDimensionPr
     }
 
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {
-        try configuration.layerTypes.map { layerType in
+        if configuration.usesPackagedMLXFormat {
+            // Packaged Muse-Glimmer artifacts use full-history caches for all
+            // layers; window semantics are in the banded attention mask.
+            return (0 ..< configuration.hiddenLayers).map { _ in KVCacheSimple() }
+        }
+        return try configuration.layerTypes.map { layerType in
             try makeHybridAttentionKVCache(
                 parameters: parameters,
                 slidingWindow: configuration.slidingWindow,
@@ -378,6 +447,21 @@ public final class MuseGlimmerTextLLMModel: Module, LLMModel, KVCacheDimensionPr
                 result["model." + key.dropFirst("language_model.model.".count)] = value
             } else if key.hasPrefix("language_model.lm_head.") {
                 result["lm_head." + key.dropFirst("language_model.lm_head.".count)] = value
+            } else if configuration.usesPackagedMLXFormat {
+                var mapped = key
+                if mapped.hasPrefix("model.layers.") {
+                    if mapped.contains(".post_attn_norm.") {
+                        mapped = mapped.replacingOccurrences(
+                            of: ".post_attn_norm.", with: ".post_attention_layernorm.")
+                    } else if mapped.contains(".post_attention_layernorm.") {
+                        mapped = mapped.replacingOccurrences(
+                            of: ".post_attention_layernorm.", with: ".pre_feedforward_layernorm.")
+                    } else if mapped.contains(".post_ffn_norm.") {
+                        mapped = mapped.replacingOccurrences(
+                            of: ".post_ffn_norm.", with: ".post_feedforward_layernorm.")
+                    }
+                }
+                result[mapped] = value
             } else {
                 result[key] = value
             }

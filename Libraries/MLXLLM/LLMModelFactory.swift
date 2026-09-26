@@ -47,6 +47,12 @@ private func createQwen3CompatibleModel(configuration data: Data) throws -> any 
 /// Typically called via ``LLMModelFactory/loadContainer(from:using:configuration:useLatest:progressHandler:)``.
 public enum LLMTypeRegistry {
 
+    private static func createMuseGlimmerText(from data: Data) throws -> LanguageModel {
+        let configuration = try JSONDecoder.json5().decode(
+            MuseGlimmerTextLLMConfiguration.self, from: data)
+        return MuseGlimmerTextLLMModel(configuration)
+    }
+
     /// Shared instance with default model types.
     public static let shared: ModelTypeRegistry<LanguageModel> = .init(creators: [
         "mistral": create(LlamaConfiguration.self, LlamaModel.init),
@@ -70,7 +76,8 @@ public enum LLMTypeRegistry {
         "qwen3_5": create(Qwen35Configuration.self, Qwen35Model.init),
         "qwen3_5_moe": create(Qwen35Configuration.self, Qwen35MoEModel.init),
         "qwen3_5_text": create(Qwen35TextConfiguration.self, Qwen35TextModel.init),
-        "muse_glimmer_text": create(MuseGlimmerTextLLMConfiguration.self, MuseGlimmerTextLLMModel.init),
+        "muse_glimmer_text": createMuseGlimmerText,
+        "muse_glimmer": createMuseGlimmerText,
         "nanbeige": create(NanbeigeConfiguration.self, NanbeigeModel.init),
         "minicpm": create(MiniCPMConfiguration.self, MiniCPMModel.init),
         "starcoder2": create(Starcoder2Configuration.self, Starcoder2Model.init),
