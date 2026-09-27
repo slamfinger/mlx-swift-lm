@@ -339,6 +339,22 @@ public final class ChatSession {
     private let model: ModelContainer
     public var instructions: String?
     private let cache: SerialAccessContainer<Cache>
+
+    /// B-6 cross-session token-prefix sharing (SIMIGO17_PREFIX_POOL gate).
+    ///
+    /// Installed by the host runtime: given the FULL rendered token ids of
+    /// a genuinely cold (fresh-session) prefill, return a cache snapshot
+    /// that covers a VERIFIED prefix of those tokens plus the covered
+    /// count. Causal KV makes a token-prefix match sound regardless of
+    /// message boundaries or template wrapper positions: KV[0..<T] depends
+    /// only on tokens[0..<T]. Return nil for no boundary. The host owns
+    /// reconciliation (token-chain hash + artifact claims); the session
+    /// only installs and narrows. Never consulted for media inputs or
+    /// sessions carrying model state.
+    nonisolated(unsafe) public static var crossSessionPrefixLookup:
+        (@Sendable (_ promptTokenIds: [Int]) -> (
+            cache: PromptCacheSnapshot, matchedTokenCount: Int
+        )?)?
     private let loadedDraftModel: SerialAccessContainer<ModelContainer?>
     public var processing: UserInput.Processing
     public var generateParameters: GenerateParameters
@@ -1199,6 +1215,31 @@ public final class ChatSession {
                             switch decision {
                             case .prefillAll:
                                 cacheReuseMode = "cold"
+                                // B-6 (SIMIGO17): a genuinely cold fresh session may
+                                // still be seedable from a CROSS-SESSION token-prefix
+                                // boundary. Guards: text-only, no model state, empty
+                                // ledger, and the snapshot must cover a strict prefix
+                                // (at least one token remains to prefill).
+                                if conversation?.cachedTokens.isEmpty == true,
+                                    !carriesPreparedMedia, input.text.mask == nil,
+                                    lmState == nil,
+                                    let hook = Self.crossSessionPrefixLookup
+                                {
+                                    let seeded = hook(promptTokenIds)
+                                    if let (snapshot, matched) = seeded,
+                                        matched > 0, matched < promptTokenIds.count,
+                                        snapshot.cache.count == kvCache.cache.count
+                                    {
+                                        kvCache.replace(with: snapshot.cache)
+                                        lmState = snapshot.state
+                                        conversation?.cachedTokens = Array(
+                                            promptTokenIds[..<matched])
+                                        input = LMInput(
+                                            tokens: MLXArray(Array(promptTokenIds[matched...])))
+                                        cachedPromptTokenCount = matched
+                                        cacheReuseMode = "cross-session"
+                                    }
+                                }
 
                             case .appendSuffix(let suffixStart, _):
                                 input = LMInput(
@@ -1643,6 +1684,65 @@ public final class ChatSession {
             switch cache {
             case .kvcache(let stored):
                 try savePromptCache(url: url, cache: stored.main.cache, state: stored.state)
+            default:
+                throw ChatSessionError.noCacheAvailable
+            }
+        }
+    }
+
+    /// B-6 (SIMIGO17): the rendered token stream this session's cache
+    /// currently represents. Empty when no conversation ledger exists.
+    public func cachedTokenIds() async -> [Int] {
+        await cache.read { cache in
+            switch cache {
+            case .kvcache(let stored):
+                return stored.conversation?.cachedTokens ?? []
+            default:
+                return []
+            }
+        }
+    }
+
+    /// B-6 (SIMIGO17): serialize the cache TRUNCATED to the first
+    /// `tokenCount` tokens — a cross-session prefix boundary. Sound by
+    /// causal KV: rows [0..<T] depend only on tokens [0..<T].
+    ///
+    /// v1 constraints (both throw rather than degrade): plain sliceable
+    /// layers only (all `KVCacheSimple`), and no carried model state
+    /// (M-RoPE rope deltas etc. are not sliced). The token ids themselves
+    /// are the caller's chain-hash input; claims verification stays with
+    /// the host's pool.
+    public func savePrefixSnapshot(to url: URL, upTo tokenCount: Int) async throws {
+        try await cache.read { cache in
+            switch cache {
+            case .kvcache(let stored):
+                guard stored.state == nil else {
+                    throw ChatSessionError.noCacheAvailable
+                }
+                guard
+                    stored.main.processedTokenCount >= tokenCount,
+                    stored.main.processedTokenCount
+                        == (stored.conversation?.cachedTokens.count ?? -1)
+                else {
+                    throw ChatSessionError.noCacheAvailable
+                }
+                guard stored.main.cache.count > 0 else {
+                    throw ChatSessionError.noCacheAvailable
+                }
+                var sliced: [KVCache] = []
+                for layer in stored.main.cache {
+                    guard let simple = layer as? KVCacheSimple else {
+                        throw ChatSessionError.noCacheAvailable
+                    }
+                    let state = simple.state
+                    guard let first = state.first, first.dim(2) >= tokenCount else {
+                        throw ChatSessionError.noCacheAvailable
+                    }
+                    let copy = KVCacheSimple()
+                    copy.state = state.map { $0[.ellipsis, ..<tokenCount, 0...] }
+                    sliced.append(copy)
+                }
+                try savePromptCache(url: url, cache: sliced)
             default:
                 throw ChatSessionError.noCacheAvailable
             }
