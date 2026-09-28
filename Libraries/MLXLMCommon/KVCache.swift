@@ -1874,12 +1874,12 @@ public struct PromptCacheSnapshot {
 ///   - cache: The model cache state
 ///   - metadata: Optional metadata to save along with cache state
 ///   - state: Optional model state associated with the cache
-public func savePromptCache(
+public func savePromptCacheWithReceipt(
     url: URL,
     cache: [KVCache],
     metadata: [String: String] = [:],
     state: LMOutput.State? = nil
-) throws {
+) throws -> SaveReceipt {
     let stateArrays = try promptCacheStateArrays(state, userMetadata: metadata)
     guard stateArrays.isEmpty || !cache.isEmpty else {
         throw KVCacheError(message: "Model state requires at least one prompt cache")
@@ -1922,7 +1922,18 @@ public func savePromptCache(
     addPromptCacheState(
         stateArrays, flattenedData: &flattenedData, flattenedMetadata: &flattenedMetadata)
 
-    try save(arrays: flattenedData, metadata: flattenedMetadata, url: url)
+    return try saveWithReceipt(arrays: flattenedData, metadata: flattenedMetadata, url: url)
+}
+
+/// Compatibility API preserving the existing no-result prompt-cache save call.
+public func savePromptCache(
+    url: URL,
+    cache: [KVCache],
+    metadata: [String: String] = [:],
+    state: LMOutput.State? = nil
+) throws {
+    _ = try savePromptCacheWithReceipt(
+        url: url, cache: cache, metadata: metadata, state: state)
 }
 
 /// Load a prompt cache from a file, without model state.
