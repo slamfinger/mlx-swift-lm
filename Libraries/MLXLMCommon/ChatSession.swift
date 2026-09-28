@@ -1746,11 +1746,12 @@ public final class ChatSession {
     /// - Parameter url: the file URL to write the cache to
     /// - Throws: ``ChatSessionError/noCacheAvailable`` if no generation has occurred yet,
     ///   or any error thrown by the underlying file write
-    public func saveCache(to url: URL) async throws {
+    public func saveCache(to url: URL) async throws -> SaveReceipt {
         try await cache.read { cache in
             switch cache {
             case .kvcache(let stored):
-                try savePromptCache(url: url, cache: stored.main.cache, state: stored.state)
+                return try savePromptCacheWithReceipt(
+                    url: url, cache: stored.main.cache, state: stored.state)
             default:
                 throw ChatSessionError.noCacheAvailable
             }
