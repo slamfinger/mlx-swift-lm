@@ -169,6 +169,7 @@ public final class ChatSession {
         @discardableResult
         mutating func record(
             _ assistant: AssistantGeneration,
+            promptTokens: [Int],
             generatedTokens: [Int],
             processedTokenCount: Int,
             prefillTokenCount: Int,
@@ -218,11 +219,19 @@ public final class ChatSession {
                 return false
             }
 
-            let cachedTokenCount = cachedTokens.count
-            if processedTokenCount >= cachedTokenCount,
-                processedTokenCount - cachedTokenCount <= generatedTokens.count
+            // The physical cache contains the entire rendered prompt after prefill,
+            // including the suffix that was appended to a carried prefix.  The old check
+            // compared processedTokenCount directly against cachedTokens.count; on a seeded
+            // restore that made the delta-prefill tokens look like unaccounted generation
+            // and wiped the ledger at the end of the first warm turn.  Rebase the ledger to
+            // the authoritative full prompt token sequence, then append only tokens that
+            // physically advanced the cache beyond that prompt.
+            let promptTokenCount = promptTokens.count
+            if processedTokenCount >= promptTokenCount,
+                processedTokenCount - promptTokenCount <= generatedTokens.count
             {
-                let committedGeneratedTokenCount = processedTokenCount - cachedTokenCount
+                let committedGeneratedTokenCount = processedTokenCount - promptTokenCount
+                cachedTokens = promptTokens
                 cachedTokens.append(
                     contentsOf: generatedTokens.prefix(committedGeneratedTokenCount))
                 uncommittedTokens = Array(
@@ -1535,6 +1544,7 @@ public final class ChatSession {
                         if var currentConversation = conversation {
                             let recordedAssistant = currentConversation.record(
                                 assistant,
+                                promptTokens: promptTokenIds,
                                 generatedTokens: generatedTokens,
                                 processedTokenCount: kvCache.processedTokenCount,
                                 prefillTokenCount: input.text.tokens.size,
