@@ -316,6 +316,12 @@ final class HarmonyChatSessionRoundTripTests: XCTestCase {
 
         let reply = try await session.respond(to: "Weather in Paris?")
 
+        // Ledger contract for speculative rounds (record()): generatedTokens
+        // may carry verifier lookahead, but only `processed - prompt` tokens
+        // are committed. The offset-12 witness below proves the committed
+        // ledger stopped at the verifier round boundary — a lookahead token
+        // that leaked into the ledger would push the restart prefill beyond
+        // offset 12 and fail this assertion.
         XCTAssertEqual(dispatched.all.count, 1)
         XCTAssertEqual(dispatched.all.first?.function.name, "get_weather")
         XCTAssertEqual(dispatched.all.first?.function.arguments["city"], .string("Paris"))

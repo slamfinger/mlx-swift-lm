@@ -172,16 +172,15 @@ public final class ChatSession {
             promptTokens: [Int],
             generatedTokens: [Int],
             processedTokenCount: Int,
-            prefillTokenCount: Int,
             mainCache: KVCacheStorage,
             draftCache: KVCacheStorage?
         ) -> Bool {
             guard assistant.shouldRecord else {
                 // Retain the last token of the prefill window the cold render can
-                // reproduce. `prefillTokenCount` (P) is the prompt size at the
-                // cancelled request, not the carried ledger size, so a cancel that
-                // lands mid-prefill still keeps a usable P-1 prefix.
-                let confirmedTokenCount = min(processedTokenCount, prefillTokenCount)
+                // reproduce. The authoritative prompt of THIS turn is
+                // `promptTokens` (the full rendered sequence); a cancel that
+                // lands mid-prefill keeps a usable confirmed-1 prefix of it.
+                let confirmedTokenCount = min(processedTokenCount, promptTokens.count)
                 let retainedTokenCount = confirmedTokenCount - 1
                 let canRetainCancelledPrefix =
                     retainedTokenCount > 0
@@ -206,7 +205,12 @@ public final class ChatSession {
                     } ?? true
 
                     if didTrimMain && didTrimDraft {
-                        cachedTokens.removeLast()
+                        // The retained rows are a prefix of THIS turn's rendered
+                        // prompt: rebuild the ledger from the authoritative tokens
+                        // instead of mutating the pre-turn ledger — which may
+                        // still be the seed prefix when the cancel lands before
+                        // record() rebased it to the full prompt.
+                        cachedTokens = Array(promptTokens[..<retainedTokenCount])
                         uncommittedTokens.removeAll()
                         return false
                     }
@@ -1163,26 +1167,42 @@ public final class ChatSession {
                                 if cachedTokenCount <= promptTokenIds.count {
                                     currentConversation.cachedTokens = Array(
                                         promptTokenIds.prefix(cachedTokenCount))
+                                } else {
+                                    // The restored cache holds more progress than the
+                                    // rendered transcript can explain — the snapshot and
+                                    // the transcript disagree. Invalidate the ledger so
+                                    // every reuse rule refuses and the terminal rule
+                                    // rebuilds, instead of carrying an unexplained cache
+                                    // behind a cleared bootstrap flag.
+                                    currentConversation.cachedTokens.removeAll()
                                 }
                                 currentConversation.ledgerBootstrapPending = false
                             }
                             let cachedTokenIds = currentConversation.cachedTokens
+                            let mainOffsetsAligned = kvCache.nativeAttentionOffsetsAreAligned
                             assert(
-                                kvCache.nativeAttentionOffsetsAreAligned,
+                                mainOffsetsAligned,
                                 "Main attention cache offsets diverged from model-cache progress"
                                     + " processed=\(kvCache.processedTokenCount)"
                                     + " ledger=\(cachedTokenIds.count)"
                                     + " layerOffsets=\(kvCache.cache.map(\.offset))")
                             let mainCacheIsAligned =
-                                kvCache.processedTokenCount == cachedTokenIds.count
+                                // Release builds compile asserts out: fold the layer
+                                // alignment into the policy input so a desynced cache
+                                // is rebuilt instead of silently reused.
+                                mainOffsetsAligned
+                                && kvCache.processedTokenCount == cachedTokenIds.count
                             let draftCacheIsAligned: Bool
                             if let draftKVCache {
+                                let draftOffsetsAligned =
+                                    draftKVCache.nativeAttentionOffsetsAreAligned
                                 assert(
-                                    draftKVCache.nativeAttentionOffsetsAreAligned,
+                                    draftOffsetsAligned,
                                     "Draft attention cache offsets diverged from model-cache progress"
                                 )
                                 draftCacheIsAligned =
-                                    draftKVCache.processedTokenCount == cachedTokenIds.count
+                                    draftOffsetsAligned
+                                    && draftKVCache.processedTokenCount == cachedTokenIds.count
                             } else {
                                 // Tentatively reuse the main cache. If speculative
                                 // decoding is admitted below, both caches are rebuilt
@@ -1561,7 +1581,6 @@ public final class ChatSession {
                                 promptTokens: turnPromptTokenIds,
                                 generatedTokens: generatedTokens,
                                 processedTokenCount: kvCache.processedTokenCount,
-                                prefillTokenCount: input.text.tokens.size,
                                 mainCache: kvCache,
                                 draftCache: draftKVCache)
                             if !recordedAssistant,
