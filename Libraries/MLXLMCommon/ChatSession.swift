@@ -1272,7 +1272,12 @@ public final class ChatSession {
                                         matched > 0, matched < promptTokenIds.count,
                                         snapshot.cache.count == kvCache.cache.count
                                     {
-                                        kvCache.replace(with: snapshot.cache)
+                                        // The seed physically advances every layer by
+                                        // `matched` rows; the logical timeline moves with
+                                        // it so ledger == processed == rows holds at the
+                                        // seed exit (record() then reconciles the delta).
+                                        kvCache.replace(
+                                            with: snapshot.cache, processedTokenCount: matched)
                                         lmState = snapshot.state
                                         conversation?.cachedTokens = Array(
                                             promptTokenIds[..<matched])
