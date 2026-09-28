@@ -1169,7 +1169,10 @@ public final class ChatSession {
                             let cachedTokenIds = currentConversation.cachedTokens
                             assert(
                                 kvCache.nativeAttentionOffsetsAreAligned,
-                                "Main attention cache offsets diverged from model-cache progress")
+                                "Main attention cache offsets diverged from model-cache progress"
+                                    + " processed=\(kvCache.processedTokenCount)"
+                                    + " ledger=\(cachedTokenIds.count)"
+                                    + " layerOffsets=\(kvCache.cache.map(\.offset))")
                             let mainCacheIsAligned =
                                 kvCache.processedTokenCount == cachedTokenIds.count
                             let draftCacheIsAligned: Bool
