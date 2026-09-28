@@ -1145,8 +1145,14 @@ public final class ChatSession {
                         let carriesPreparedMedia =
                             preparedInput.image != nil || preparedInput.video != nil
                             || preparedInput.audio != nil
+                        // Full rendered prompt token ids of THIS restart iteration —
+                        // captured at the policy boundary and consumed by the
+                        // post-generation ledger record (the record site sits outside
+                        // this block's scope).
+                        var turnPromptTokenIds: [Int] = []
                         if var currentConversation = conversation {
                             let promptTokenIds = input.text.tokens.asArray(Int.self)
+                            turnPromptTokenIds = promptTokenIds
                             if currentConversation.ledgerBootstrapPending {
                                 // The snapshot stores KV/state but not the private token ledger.
                                 // For a transcript-aware restore, the first rendered prompt is
@@ -1544,7 +1550,7 @@ public final class ChatSession {
                         if var currentConversation = conversation {
                             let recordedAssistant = currentConversation.record(
                                 assistant,
-                                promptTokens: promptTokenIds,
+                                promptTokens: turnPromptTokenIds,
                                 generatedTokens: generatedTokens,
                                 processedTokenCount: kvCache.processedTokenCount,
                                 prefillTokenCount: input.text.tokens.size,
