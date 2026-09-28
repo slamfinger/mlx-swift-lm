@@ -156,6 +156,10 @@ public final class ChatSession {
         /// matches the model-cache progress. An empty value paired with
         /// nonzero progress is an invalidated ledger and forces a rebuild.
         var cachedTokens: [Int]
+        /// A restored raw KV cache may be paired with its message transcript, but
+        /// the exact token ledger is not serialized. Bootstrap it from the first
+        /// rendered prompt exactly once before prompt-cache reuse is decided.
+        var ledgerBootstrapPending: Bool = false
 
         /// Tokens returned by the previous generation but not yet represented
         /// by `cachedTokens`. This is normally empty; a speculative round can
@@ -585,6 +589,7 @@ public final class ChatSession {
         instructions: String? = nil,
         cache: consuming [KVCache],
         state: LMOutput.State? = nil,
+        history: consuming [Chat.Message]? = nil,
         speculativeDecoding: SpeculativeDecodingConfig? = nil,
         generateParameters: GenerateParameters = .init(),
         components: GenerationComponents = .init(),
@@ -600,6 +605,12 @@ public final class ChatSession {
                 .init(
                     cache: cache,
                     state: state,
+                    conversation: history.map {
+                        Conversation(
+                            messages: $0,
+                            cachedTokens: [],
+                            ledgerBootstrapPending: true)
+                    },
                     plan: (try? generateParameters.kvCachePlan()) ?? .disabled)))
         self.loadedDraftModel = .init(speculativeDecoding?.draftModel)
         self.processing = processing
@@ -1127,6 +1138,19 @@ public final class ChatSession {
                             || preparedInput.audio != nil
                         if var currentConversation = conversation {
                             let promptTokenIds = input.text.tokens.asArray(Int.self)
+                            if currentConversation.ledgerBootstrapPending {
+                                // The snapshot stores KV/state but not the private token ledger.
+                                // For a transcript-aware restore, the first rendered prompt is
+                                // the only authoritative tokenization available at this boundary.
+                                // Seed exactly the already-cached prefix, then return to the normal
+                                // PromptCacheReusePolicy path for every later turn.
+                                let cachedTokenCount = kvCache.processedTokenCount
+                                if cachedTokenCount <= promptTokenIds.count {
+                                    currentConversation.cachedTokens = Array(
+                                        promptTokenIds.prefix(cachedTokenCount))
+                                }
+                                currentConversation.ledgerBootstrapPending = false
+                            }
                             let cachedTokenIds = currentConversation.cachedTokens
                             assert(
                                 kvCache.nativeAttentionOffsetsAreAligned,
