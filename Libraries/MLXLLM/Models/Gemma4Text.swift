@@ -868,8 +868,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
         } else {
             out = model.embedTokens.asLinear(out)
         }
-        out = tanh(out / config.finalLogitSoftcapping) * config.finalLogitSoftcapping
-        return out
+        return gemma4LogitSoftcap(out, config.finalLogitSoftcapping)
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
