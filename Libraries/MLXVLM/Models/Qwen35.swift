@@ -1859,8 +1859,24 @@ public class Qwen35: Module, VLMModel {
         MLXArray]
     {
         if metadata["format"]?.lowercased() == "mlx" {
-            // Converted checkpoints can keep the MTP head; the drafter loads it, not this model.
-            return weights.filter { !$0.key.contains("mtp.") }
+            // Converted checkpoints can keep the MTP head; the drafter loads it, not
+            // this model. Some MLX conversions also keep HF-style `visual.*` paths
+            // for the vision tower (ukisai/Swift-1.5-4bit-MLX) instead of the
+            // `vision_tower.*` mount — normalize the prefix, or the load fails
+            // demanding tower weights that never arrive (2026-10-15:
+            // "Key vision_tower...linear_fc2.bias not found").
+            var normalized: [String: MLXArray] = [:]
+            normalized.reserveCapacity(weights.count)
+            for (key, value) in weights where !key.contains("mtp.") {
+                if key.hasPrefix("visual.") {
+                    normalized[
+                        "vision_tower." + String(key.dropFirst("visual.".count))
+                    ] = value
+                } else {
+                    normalized[key] = value
+                }
+            }
+            return normalized
         }
         return sanitize(weights: weights)
     }
@@ -1915,6 +1931,9 @@ public class Qwen35: Module, VLMModel {
                     // `model.language_model.*`. Mirror the LLM-side fallback.
                     key = "language_model." + key
                 }
+            } else if key.hasPrefix("visual.") {
+                // Bare HF-style vision prefix without the `model.` wrapper.
+                key = "vision_tower." + String(key.dropFirst("visual.".count))
             } else if key.contains("lm_head") {
                 key = key.replacingOccurrences(of: "lm_head", with: "language_model.lm_head")
             }
