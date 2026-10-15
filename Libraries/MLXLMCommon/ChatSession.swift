@@ -401,8 +401,11 @@ public final class ChatSession {
             public init() {}
         }
 
-        /// Identity of the installing owner; compare with `===`.
-        public let owner: OwnerToken
+        /// Identity of the installing owner. PRIVATE and unreadable
+        /// (FCI-OWN-03): a wrapper cannot read this token to construct a
+        /// forwarding struct that carries it — identity is comparable via
+        /// ``isOwned(by:)`` but not transferable.
+        private let owner: OwnerToken
         public let lookup: @Sendable (
             _ promptTokenIds: [Int], _ caller: CrossSessionCallerContext
         ) -> (cache: PromptCacheSnapshot, matchedTokenCount: Int)?
@@ -415,6 +418,12 @@ public final class ChatSession {
         ) {
             self.owner = owner
             self.lookup = lookup
+        }
+
+        /// Ownership comparison WITHOUT exposing the token: only a party
+        /// that already holds the exact token can ever see `true`.
+        public func isOwned(by token: OwnerToken) -> Bool {
+            owner === token
         }
     }
 
