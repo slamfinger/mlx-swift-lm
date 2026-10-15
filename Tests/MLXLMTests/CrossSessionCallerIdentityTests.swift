@@ -126,10 +126,13 @@ final class CrossSessionCallerIdentityTests: XCTestCase {
     func testContextHookReceivesCallingSessionDirectory() async throws {
         let directory = URL(fileURLWithPath: "/models/caller-A", isDirectory: true)
         let recorder = ContextRecorder()
-        ChatSession.crossSessionPrefixLookupWithContext = { _, caller in
-            recorder.record(caller.modelDirectory)
-            return nil
-        }
+        ChatSession.crossSessionPrefixLookupWithContext =
+            ChatSession.CrossSessionPrefixLookup(
+                owner: ChatSession.CrossSessionPrefixLookup.OwnerToken(),
+                lookup: { _, caller in
+                    recorder.record(caller.modelDirectory)
+                    return nil
+                })
         _ = try await respond(Self.directoryModel(directory), prompt: "hello world")
         XCTAssertEqual(recorder.values, [directory])
     }
@@ -146,10 +149,13 @@ final class CrossSessionCallerIdentityTests: XCTestCase {
             configuration: configuration,
             tokenizer: TestTokenizer())
         let recorder = ContextRecorder()
-        ChatSession.crossSessionPrefixLookupWithContext = { _, caller in
-            recorder.record(caller.modelDirectory)
-            return nil
-        }
+        ChatSession.crossSessionPrefixLookupWithContext =
+            ChatSession.CrossSessionPrefixLookup(
+                owner: ChatSession.CrossSessionPrefixLookup.OwnerToken(),
+                lookup: { _, caller in
+                    recorder.record(caller.modelDirectory)
+                    return nil
+                })
         _ = try await respond(context, prompt: "hello world")
         XCTAssertEqual(recorder.values, [nil])
     }
@@ -162,12 +168,15 @@ final class CrossSessionCallerIdentityTests: XCTestCase {
         let cacheModel = URL(fileURLWithPath: "/models/cache-B", isDirectory: true)
         let box = try seedSnapshot()
 
-        ChatSession.crossSessionPrefixLookupWithContext = { _, caller in
-            guard let origin = caller.modelDirectory, origin == cacheModel else {
-                return nil
-            }
-            return (box.snapshot, Self.boundary)
-        }
+        ChatSession.crossSessionPrefixLookupWithContext =
+            ChatSession.CrossSessionPrefixLookup(
+                owner: ChatSession.CrossSessionPrefixLookup.OwnerToken(),
+                lookup: { _, caller in
+                    guard let origin = caller.modelDirectory, origin == cacheModel else {
+                        return nil
+                    }
+                    return (box.snapshot, Self.boundary)
+                })
         let result = try await respond(
             Self.directoryModel(foreign), prompt: "seed prompt content")
         XCTAssertFalse(result.text.isEmpty)
@@ -180,10 +189,13 @@ final class CrossSessionCallerIdentityTests: XCTestCase {
         let directory = URL(fileURLWithPath: "/models/caller-A", isDirectory: true)
         let box = try seedSnapshot()
 
-        ChatSession.crossSessionPrefixLookupWithContext = { _, caller in
-            guard caller.modelDirectory == directory else { return nil }
-            return (box.snapshot, Self.boundary)
-        }
+        ChatSession.crossSessionPrefixLookupWithContext =
+            ChatSession.CrossSessionPrefixLookup(
+                owner: ChatSession.CrossSessionPrefixLookup.OwnerToken(),
+                lookup: { _, caller in
+                    guard caller.modelDirectory == directory else { return nil }
+                    return (box.snapshot, Self.boundary)
+                })
         let result = try await respond(
             Self.directoryModel(directory), prompt: "seed prompt content")
         XCTAssertEqual(result.reuseMode, "cross-session")
@@ -199,10 +211,13 @@ final class CrossSessionCallerIdentityTests: XCTestCase {
             legacy.increment()
             return nil
         }
-        ChatSession.crossSessionPrefixLookupWithContext = { _, caller in
-            recorder.record(caller.modelDirectory)
-            return nil
-        }
+        ChatSession.crossSessionPrefixLookupWithContext =
+            ChatSession.CrossSessionPrefixLookup(
+                owner: ChatSession.CrossSessionPrefixLookup.OwnerToken(),
+                lookup: { _, caller in
+                    recorder.record(caller.modelDirectory)
+                    return nil
+                })
         _ = try await respond(Self.directoryModel(directory), prompt: "hello world")
         XCTAssertEqual(recorder.values.count, 1)
         XCTAssertEqual(legacy.value, 0)
@@ -217,6 +232,9 @@ final class CrossSessionCallerIdentityTests: XCTestCase {
         ChatSession.crossSessionPrefixLookup = { _ in
             (box.snapshot, Self.boundary)
         }
+        // The legacy bridge carries the sentinel owner: distinct from every
+        // host token — verified structurally by the type system (no host
+        // can hold the sentinel).
         let result = try await respond(
             Self.directoryModel(directory), prompt: "legacy seed prompt")
         XCTAssertEqual(result.reuseMode, "cross-session")

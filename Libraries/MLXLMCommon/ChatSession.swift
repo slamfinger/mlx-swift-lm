@@ -388,6 +388,36 @@ public final class ChatSession {
         }
     }
 
+    /// The context-aware cross-session lookup: a closure PLUS the
+    /// comparable owner identity of its installer (FCI-OWN-02: marker
+    /// reachability is not slot ownership — a wrapper that forwards calls
+    /// must never be mistakable for the original owner). Hosts verify
+    /// `owner` by identity before claiming or clearing the slot.
+    public struct CrossSessionPrefixLookup: Sendable {
+        /// Identity token of the installing owner: a final immutable class
+        /// compared by `===` — wrapping closures cannot forge or forward
+        /// it (FCI-OWN-02).
+        public final class OwnerToken: @unchecked Sendable {
+            public init() {}
+        }
+
+        /// Identity of the installing owner; compare with `===`.
+        public let owner: OwnerToken
+        public let lookup: @Sendable (
+            _ promptTokenIds: [Int], _ caller: CrossSessionCallerContext
+        ) -> (cache: PromptCacheSnapshot, matchedTokenCount: Int)?
+
+        public init(
+            owner: OwnerToken,
+            lookup: @escaping @Sendable (
+                _ promptTokenIds: [Int], _ caller: CrossSessionCallerContext
+            ) -> (cache: PromptCacheSnapshot, matchedTokenCount: Int)?
+        ) {
+            self.owner = owner
+            self.lookup = lookup
+        }
+    }
+
     /// Context-aware variant of ``crossSessionPrefixLookup``. When
     /// installed, the consultation point prefers this slot and passes the
     /// calling session's origin; when it is absent, the legacy slot keeps
@@ -395,9 +425,14 @@ public final class ChatSession {
     /// slots' lifecycle: release verification may not treat the legacy
     /// slot alone as complete hook release.
     nonisolated(unsafe) public static var crossSessionPrefixLookupWithContext:
-        (@Sendable (_ promptTokenIds: [Int], _ caller: CrossSessionCallerContext) -> (
-            cache: PromptCacheSnapshot, matchedTokenCount: Int
-        )?)?
+        CrossSessionPrefixLookup?
+
+    /// Owner identity used when the consultation bridges a LEGACY closure
+    /// into the context slot's shape. It is a distinct sentinel object:
+    /// no host's owner token can ever be `===` to it, and uninstalling
+    /// hosts must not clear a slot bridged this way (it belongs to the
+    /// legacy installer).
+    private static let legacySlotOwnerSentinel = CrossSessionPrefixLookup.OwnerToken()
     private let loadedDraftModel: SerialAccessContainer<ModelContainer?>
     public var processing: UserInput.Processing
     public var generateParameters: GenerateParameters
@@ -1319,19 +1354,19 @@ public final class ChatSession {
                                 if conversation?.cachedTokens.isEmpty == true,
                                     !carriesPreparedMedia, input.text.mask == nil,
                                     lmState == nil,
-                                    let hook = Self.crossSessionPrefixLookupWithContext
-                                        ?? Self.crossSessionPrefixLookup.map({ legacy in
-                                            { (tokens: [Int],
-                                               _ caller: CrossSessionCallerContext) in
-                                                legacy(tokens)
-                                            }
-                                        })
+                                    let hook =
+                                        Self.crossSessionPrefixLookupWithContext
+                                        ?? Self.crossSessionPrefixLookup.map { legacy in
+                                            CrossSessionPrefixLookup(
+                                                owner: Self.legacySlotOwnerSentinel,
+                                                lookup: { tokens, _ in legacy(tokens) })
+                                        }
                                 {
                                     // Caller identity at the consultation point:
                                     // the calling session's own model origin. The
                                     // host validates it (nil origin or a foreign
                                     // directory refuses adoption, cold path).
-                                    let seeded = hook(
+                                    let seeded = hook.lookup(
                                         promptTokenIds,
                                         CrossSessionCallerContext(
                                             modelDirectory: callerModelOrigin))
