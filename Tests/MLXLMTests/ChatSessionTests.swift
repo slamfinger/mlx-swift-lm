@@ -297,7 +297,7 @@ public class ChatSessionTests: XCTestCase {
         }
     }
 
-    private static func makeModel(
+    static func makeModel(
         processor: any UserInputProcessor,
         configuration: ModelConfiguration,
         tokenizer: any Tokenizer

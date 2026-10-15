@@ -372,6 +372,32 @@ public final class ChatSession {
         (@Sendable (_ promptTokenIds: [Int]) -> (
             cache: PromptCacheSnapshot, matchedTokenCount: Int
         )?)?
+
+    /// Caller identity for the context-aware cross-session hook: the
+    /// CALLING session's own model origin, derived at the consultation
+    /// point from its retained `ModelConfiguration`. `nil` when the model
+    /// has no local directory origin (e.g. an unresolved hub id). Hosts use
+    /// it to refuse cross-model adoption; a refused hook (nil return)
+    /// falls back to the ordinary cold prefill path — never a partial
+    /// adoption.
+    public struct CrossSessionCallerContext: Sendable {
+        public let modelDirectory: URL?
+
+        public init(modelDirectory: URL?) {
+            self.modelDirectory = modelDirectory
+        }
+    }
+
+    /// Context-aware variant of ``crossSessionPrefixLookup``. When
+    /// installed, the consultation point prefers this slot and passes the
+    /// calling session's origin; when it is absent, the legacy slot keeps
+    /// its prior signature and behavior exactly. Owners must manage BOTH
+    /// slots' lifecycle: release verification may not treat the legacy
+    /// slot alone as complete hook release.
+    nonisolated(unsafe) public static var crossSessionPrefixLookupWithContext:
+        (@Sendable (_ promptTokenIds: [Int], _ caller: CrossSessionCallerContext) -> (
+            cache: PromptCacheSnapshot, matchedTokenCount: Int
+        )?)?
     private let loadedDraftModel: SerialAccessContainer<ModelContainer?>
     public var processing: UserInput.Processing
     public var generateParameters: GenerateParameters
@@ -999,6 +1025,14 @@ public final class ChatSession {
                     // are distinct.  In particular the KVCache cannot
                     // be shared and that is the lock that is held here.
 
+                    // Caller identity for the context-aware cross-session
+                    // hook, captured from the CONTAINER before `model` is
+                    // rebound to the LanguageModel below: the calling
+                    // session's own model origin.
+                    var callerModelOrigin: URL? = nil
+                    if case .directory(let originURL) = await model.configuration.id {
+                        callerModelOrigin = originURL
+                    }
                     let model = await model.perform { context in
                         SendableBox(context.model)
                     }.consume()
@@ -1285,9 +1319,22 @@ public final class ChatSession {
                                 if conversation?.cachedTokens.isEmpty == true,
                                     !carriesPreparedMedia, input.text.mask == nil,
                                     lmState == nil,
-                                    let hook = Self.crossSessionPrefixLookup
+                                    let hook = Self.crossSessionPrefixLookupWithContext
+                                        ?? Self.crossSessionPrefixLookup.map({ legacy in
+                                            { (tokens: [Int],
+                                               _ caller: CrossSessionCallerContext) in
+                                                legacy(tokens)
+                                            }
+                                        })
                                 {
-                                    let seeded = hook(promptTokenIds)
+                                    // Caller identity at the consultation point:
+                                    // the calling session's own model origin. The
+                                    // host validates it (nil origin or a foreign
+                                    // directory refuses adoption, cold path).
+                                    let seeded = hook(
+                                        promptTokenIds,
+                                        CrossSessionCallerContext(
+                                            modelDirectory: callerModelOrigin))
                                     if let (snapshot, matched) = seeded,
                                         matched > 0, matched < promptTokenIds.count,
                                         snapshot.cache.count == kvCache.cache.count
