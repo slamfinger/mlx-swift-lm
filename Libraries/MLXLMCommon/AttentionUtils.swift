@@ -100,6 +100,18 @@ public func attentionWithCacheUpdate(
         )
     } else {
         let (cachedKeys, cachedValues) = cache.update(keys: keys, values: values)
+        // Native update->attend abort boundary. If a KVCacheWriteObserver refused
+        // THIS step, the cache latched isolationAborted and the buffers returned
+        // above already exclude the refused write (update rolled the offset back),
+        // so a shared / unregistered KV never reaches attention. Notify the cache's
+        // step owner at this boundary so the current model step is aborted before it
+        // commits (not merely the next step). A nil handler / never-aborted cache --
+        // every normal-inference path -- short-circuits and is byte-for-byte unchanged.
+        if let observed = cache as? KVCacheIsolationObserving, observed.isolationAborted,
+           let simple = observed as? KVCacheSimple, simple.isolationAborted
+        {
+            simple.onIsolationAbort?(observed.isolationAbortReason ?? "kv_isolation_abort")
+        }
         return MLXFast.scaledDotProductAttention(
             queries: queries,
             keys: cachedKeys,

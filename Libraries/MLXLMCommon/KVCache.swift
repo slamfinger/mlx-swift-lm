@@ -443,9 +443,23 @@ public protocol KVCacheWriteObserver: AnyObject {
     ) -> KVCacheWriteDecision
 }
 
+/// A cache that can REPORT a write-boundary isolation abort to its consumer.
+///
+/// This is the native channel that closes the gap ``KVCacheWriteObserver`` opens:
+/// the public attention path calls `update(keys:values:)` and feeds the returned
+/// arrays STRAIGHT into `scaledDotProductAttention` inside a single model step
+/// (see `attentionWithCacheUpdate`). Because `update` returns a tuple rather than
+/// a throwing result, a refusal cannot, by itself, unwind the in-flight step. This
+/// protocol lets the consumer boundary (and any step owner) observe that the cache
+/// aborted, so a refused step's KV is never treated as a valid result.
+public protocol KVCacheIsolationObserving: AnyObject {
+    var isolationAborted: Bool { get }
+    var isolationAbortReason: String? { get }
+}
+
 /// Standard KV cache implementation based on Python's KVCache
 /// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
-public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
+public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible, KVCacheIsolationObserving {
     internal var keys: MLXArray?
     internal var values: MLXArray?
     public var step = 256
@@ -459,6 +473,24 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     /// checks this to BLOCK subsequent generation after a failed registration.
     public internal(set) var isolationAborted: Bool = false
     public internal(set) var isolationAbortReason: String?
+
+    /// Invoked at the native `update` -> attention consumer boundary the instant a
+    /// write-boundary observer has refused this step, BEFORE the returned buffers
+    /// reach `scaledDotProductAttention`. A G3 step owner installs this to abort the
+    /// current model step (discard its logits / do not sample or emit a token) the
+    /// moment KV registration fails, rather than only blocking the NEXT step.
+    /// `nil` by default: normal inference never trips it, so the ordinary attention
+    /// path is byte-for-byte unchanged. The buffers handed to attention on a refusal
+    /// already exclude the refused write (the offset is rolled back in `update`), so
+    /// a shared/unregistered KV never reaches the consumer even before this fires.
+    public var onIsolationAbort: ((String) -> Void)?
+
+    /// Reset the abort latch. A per-step owner calls this at the top of each
+    /// generation step so `isolationAborted` reflects ONLY the current step.
+    public func beginStep() {
+        isolationAborted = false
+        isolationAbortReason = nil
+    }
 
     public override init() {
         super.init()
