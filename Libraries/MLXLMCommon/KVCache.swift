@@ -403,12 +403,62 @@ public func createSSMMask(h: MLXArray, cache: MambaCache?) -> MLXArray? {
     return nil
 }
 
+/// Decision returned by a ``KVCacheWriteObserver`` when it is offered a freshly
+/// allocated / grown KV buffer BEFORE its first write. `.allow` lets `update`
+/// proceed to write; `.refuse(reason:)` makes `update` skip the write, roll back
+/// the offset, and latch the cache as aborted so the generation step is blocked.
+public enum KVCacheWriteDecision: Sendable {
+    case allow
+    case refuse(reason: String)
+}
+
+/// A native observation seam for the KV cache's WRITE boundary.
+///
+/// This exists so a caller that owns a cache can register the buffer's underlying
+/// storage identity BEFORE MLX first writes into it — the timing that an outer
+/// callback cannot provide, because `update(keys:values:)` allocates and writes
+/// inside a single synchronous call and `keys`/`values` are otherwise observable
+/// only after the write (via `state` / `innerState()`).
+///
+/// The observer is invoked from ``KVCacheSimple/update(keys:values:)`` immediately
+/// after the buffer has been allocated or grown, but before the step's data is
+/// written into it. Returning ``KVCacheWriteDecision/refuse(reason:)`` aborts the
+/// write. When the property is `nil` (the default, and every normal-inference
+/// cache) `update` behaves exactly as before — this seam adds no cost and no
+/// semantic change to the ordinary path.
+public protocol KVCacheWriteObserver: AnyObject {
+    /// - Parameters:
+    ///   - cache: the cache about to write.
+    ///   - keys / values: the freshly allocated/grown buffers that will be written.
+    ///   - range: the sequence-position range this step writes into.
+    ///   - freshStorage: `true` when the buffers were just allocated or grown this
+    ///     step (a new mutable storage to register), `false` when reusing an
+    ///     already-owned buffer (confirm ownership, do not re-register).
+    func kvCache(
+        _ cache: KVCacheSimple,
+        willWriteKeys keys: MLXArray,
+        values: MLXArray,
+        range: Range<Int>,
+        freshStorage: Bool
+    ) -> KVCacheWriteDecision
+}
+
 /// Standard KV cache implementation based on Python's KVCache
 /// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
     internal var keys: MLXArray?
     internal var values: MLXArray?
     public var step = 256
+
+    /// The native write-boundary observer. `nil` by default, so normal inference
+    /// is untouched. A G3 arm installs one that registers the buffer's underlying
+    /// storage identity before its first write and refuses a shared buffer.
+    public var writeObserver: KVCacheWriteObserver?
+    /// Latched `true` when a ``KVCacheWriteObserver`` refused a write, so the cache
+    /// neither wrote the shared buffer nor advanced this step. A generation loop
+    /// checks this to BLOCK subsequent generation after a failed registration.
+    public internal(set) var isolationAborted: Bool = false
+    public internal(set) var isolationAbortReason: String?
 
     public override init() {
         super.init()
@@ -453,6 +503,28 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
         }
 
         self.offset += keys.dim(2)
+
+        // Native write-boundary gate: after the buffer exists (allocated or grown)
+        // but BEFORE its first write of this step's data. A nil observer short-
+        // circuits, so the ordinary path is byte-for-byte unchanged. On refusal we
+        // roll the offset back and DO NOT write, so a shared buffer is never
+        // touched and the step is recorded as aborted (blocks subsequent generation).
+        if let writeObserver {
+            switch writeObserver.kvCache(
+                self, willWriteKeys: self.keys!, values: self.values!,
+                range: previous ..< self.offset, freshStorage: reset
+            ) {
+            case .allow:
+                break
+            case let .refuse(reason):
+                self.offset = previous
+                isolationAborted = true
+                isolationAbortReason = reason
+                let returnedKeys = self.keys![.ellipsis, ..<self.offset, 0...]
+                let returnedValues = self.values![.ellipsis, ..<self.offset, 0...]
+                return (returnedKeys, returnedValues)
+            }
+        }
 
         self.keys?[.ellipsis, previous ..< self.offset, 0...] = keys
         self.values?[.ellipsis, previous ..< self.offset, 0...] = values
