@@ -457,6 +457,21 @@ public protocol KVCacheIsolationObserving: AnyObject {
     var isolationAbortReason: String? { get }
 }
 
+/// The capability returned when a write observer is BOUND to a cache.
+///
+/// No public initializer and `fileprivate` fields: only ``KVCacheSimple`` mints
+/// one, and only the caller that received it can hand it back to
+/// ``KVCacheSimple/unbindWriteObserver(_:)``. Holding a cache reference is not,
+/// by itself, authority to remove or replace its write gate.
+public struct KVCacheWriteObserverBinding: Hashable, Sendable {
+    fileprivate let cacheID: UUID
+    fileprivate let nonce: UUID
+
+    /// Non-secret identity of this binding, for a pre-execution verification that
+    /// does not need the capability itself.
+    public var id: UUID { nonce }
+}
+
 /// Standard KV cache implementation based on Python's KVCache
 /// See https://github.com/ml-explore/mlx-examples/blob/main/llms/mlx_lm/models/base.py#L11
 public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible, KVCacheIsolationObserving {
@@ -465,9 +480,61 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible, KVCacheIs
     public var step = 256
 
     /// The native write-boundary observer. `nil` by default, so normal inference
-    /// is untouched. A G3 arm installs one that registers the buffer's underlying
-    /// storage identity before its first write and refuses a shared buffer.
-    public var writeObserver: KVCacheWriteObserver?
+    /// is untouched.
+    ///
+    /// A G3 arm does NOT assign this property directly: it BINDS an observer with
+    /// ``bindWriteObserver(_:)``, which returns the capability needed to unbind.
+    /// Once bound, ordinary assignment cannot clear or replace the gate — a
+    /// mutation is refused and latched as a binding violation, so clearing the
+    /// hook cannot silently un-gate a cache.
+    public var writeObserver: KVCacheWriteObserver? {
+        get { _writeObserver }
+        set {
+            guard _writeObserverBinding != nil else {
+                _writeObserver = newValue
+                return
+            }
+            // Idempotent re-assignment of the SAME observer is not a mutation.
+            if newValue === _writeObserver { return }
+            observerBindingViolation = "write_observer_mutated_after_binding"
+            isolationAborted = true
+            isolationAbortReason = observerBindingViolation
+        }
+    }
+    private var _writeObserver: KVCacheWriteObserver?
+    private var _writeObserverBinding: KVCacheWriteObserverBinding?
+    /// Non-secret identity of the active binding, or nil while unbound.
+    public private(set) var writeObserverBindingID: UUID?
+    /// Latched when ordinary code tried to clear or replace a BOUND observer. It
+    /// is never cleared: a cache whose gate was tampered with must fail closed on
+    /// every later step, not resume writing unobserved after a reset.
+    public private(set) var observerBindingViolation: String?
+
+    /// Bind `observer` as this cache's write gate and return the capability that
+    /// alone permits unbinding. Returns nil when the cache already carries a
+    /// binding or an observer, so a second gate cannot silently replace the first.
+    @discardableResult
+    public func bindWriteObserver(_ observer: KVCacheWriteObserver) -> KVCacheWriteObserverBinding? {
+        guard _writeObserverBinding == nil, _writeObserver == nil else { return nil }
+        let binding = KVCacheWriteObserverBinding(cacheID: bindingCacheID, nonce: UUID())
+        _writeObserver = observer
+        _writeObserverBinding = binding
+        writeObserverBindingID = binding.id
+        return binding
+    }
+
+    /// Remove the write gate. Only the capability minted by ``bindWriteObserver``
+    /// is accepted; a borrowed or forged one is refused and changes nothing.
+    @discardableResult
+    public func unbindWriteObserver(_ binding: KVCacheWriteObserverBinding) -> Bool {
+        guard _writeObserverBinding == binding else { return false }
+        _writeObserver = nil
+        _writeObserverBinding = nil
+        writeObserverBindingID = nil
+        return true
+    }
+
+    private let bindingCacheID = UUID()
     /// Latched `true` when a ``KVCacheWriteObserver`` refused a write, so the cache
     /// neither wrote the shared buffer nor advanced this step. A generation loop
     /// checks this to BLOCK subsequent generation after a failed registration.
@@ -487,7 +554,15 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible, KVCacheIs
 
     /// Reset the abort latch. A per-step owner calls this at the top of each
     /// generation step so `isolationAborted` reflects ONLY the current step.
+    ///
+    /// A binding violation is the exception: it is permanent, so a reset cannot
+    /// make a tampered cache look live again.
     public func beginStep() {
+        if let violation = observerBindingViolation {
+            isolationAborted = true
+            isolationAbortReason = violation
+            return
+        }
         isolationAborted = false
         isolationAbortReason = nil
     }
@@ -501,6 +576,15 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible, KVCacheIs
     }
 
     public override func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        // Fail closed if the gate was tampered with. The observer setter already
+        // refuses the mutation, so the hook is still installed here; this check is
+        // the second line of defence for a direct `update` that bypassed a step
+        // owner's pre-execution verification.
+        if let violation = observerBindingViolation {
+            isolationAborted = true
+            isolationAbortReason = violation
+            return (keys[.ellipsis, ..<0, 0...], values[.ellipsis, ..<0, 0...])
+        }
         let previous = self.offset
 
         let reset =
