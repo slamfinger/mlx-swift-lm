@@ -199,6 +199,11 @@ public protocol KVCacheAttentionProtocol: KVCache {
 
 /// Base cache implementation providing default behaviors
 open class BaseKVCache: KVCache {
+    /// Public because this class is `open`: without it no cache kind can be defined
+    /// outside this module, and the default-refuses contract of
+    /// ``detachedCopy()`` could not be exercised for a kind added later.
+    public init() {}
+
     public var offset: Int = 0
     public var maxSize: Int? { nil }
 
@@ -241,6 +246,41 @@ open class BaseKVCache: KVCache {
 
     open func copy() -> any KVCache {
         fatalError("copy() must be implemented by subclass")
+    }
+
+    /// A copy whose KV arrays own storage no other array reads.
+    ///
+    /// ``copy()`` is a slice: `state.map { $0[.ellipsis] }` keeps reading the
+    /// source's buffer. That is the right trade for two live branches -- neither
+    /// sees the other's writes -- and the wrong one for a branch that is about to
+    /// retire the other, because the survivor would still hold the pages.
+    ///
+    /// The default refuses. A cache kind that has not been taught how to detach
+    /// has to fail a strict-isolation continuation rather than be handed over
+    /// sharing storage with the source it was supposed to replace.
+    open func detachedCopy() throws -> any KVCache {
+        throw DetachedForkError.unsupportedCacheKind(String(describing: type(of: self)))
+    }
+
+    /// Detach by cloning through ``copy()`` and re-materializing the visible state.
+    ///
+    /// Going through `copy()` keeps every type-specific field (step, keep, idx,
+    /// chunk size, quantization parameters, ...) in the hands of the code that
+    /// already knows how to restore it; only the arrays that carry KV bytes are
+    /// replaced. Capacity is deliberately not copied: the visible rows are the
+    /// whole logical cache, and duplicating a ring's unused tail would multiply
+    /// the copy for rows nothing reads.
+    func detachedClone() throws -> any KVCache {
+        var clone = copy()
+        let arrays = try KVCacheDetachment.owningCopies(of: state)
+        if !arrays.isEmpty {
+            clone.state = arrays
+        }
+        // Both setters may move metadata (`KVCacheSimple`'s state setter rewrites
+        // `offset` from the array's row count), so restore it afterwards.
+        clone.metaState = metaState
+        (clone as? BaseKVCache)?.offset = offset
+        return clone
     }
 
     open func prepare(lengths: [Int]?) {}
@@ -547,6 +587,10 @@ public class KVCacheSimple: BaseKVCache, CustomDebugStringConvertible {
             new.state = s.map { $0[.ellipsis] }
         }
         return new
+    }
+
+    public override func detachedCopy() throws -> any KVCache {
+        try detachedClone()
     }
 
     public var debugDescription: String {
@@ -963,6 +1007,14 @@ public class RotatingKVCache: BaseKVCache, CustomDebugStringConvertible {
         return new
     }
 
+    /// Detaches `keep`/`maxSize`/`step`/`offset`/`idx`/origin/wrapped through
+    /// `metaState`, so a wrapped ring comes back wrapped and pointing at the same
+    /// position -- the ring's layout is metadata here, not something recoverable
+    /// from the array shapes alone.
+    public override func detachedCopy() throws -> any KVCache {
+        try detachedClone()
+    }
+
     /// Convert to a quantized cache.
     ///
     /// Rotating-cache quantization needs a representation that preserves temporal ordering and
@@ -1263,6 +1315,13 @@ public class QuantizedKVCache: BaseKVCache, QuantizedKVCacheProtocol {
         return new
     }
 
+    /// Detaches all six (or four) packed arrays. The packed words, scales and
+    /// biases are copied verbatim: dequantizing and requantizing would round
+    /// differently and quietly change the continuation's KV values.
+    public override func detachedCopy() throws -> any KVCache {
+        try detachedClone()
+    }
+
     /// Convert to unquantized cache
     public func toUnquantized() -> KVCacheSimple {
         let simpleCache = KVCacheSimple()
@@ -1363,6 +1422,24 @@ public class ChunkedKVCache: KVCacheSimple {
         return new
     }
 
+    /// Refuses, deliberately.
+    ///
+    /// `maybeTrimFront()` drops rows from the front of the buffer but leaves
+    /// `offset` counting from the original origin, so this cache's `state` getter
+    /// slices `..<offset` past the rows the buffer now holds. A copy taken by
+    /// copying the buffers whole would be numerically right and still
+    /// **unverifiable**: the gate reads `state` to compare the two sides, and the
+    /// copy's own `state` is out of bounds, so there is no honest way to prove the
+    /// detached cache carries the same KV bytes. A strict-isolation continuation
+    /// that cannot be verified has to be refused (no silent fallback to sharing),
+    /// so this kind is refused until the trim offsets are made representable.
+    public override func detachedCopy() throws -> any KVCache {
+        throw DetachedForkError.invalidState(
+            "ChunkedKVCache: `state` cannot express a front-trimmed buffer "
+                + "(offset counts from the untrimmed origin), so a detached copy "
+                + "could not be verified against the source; refusing")
+    }
+
     public override var metaState: [String] {
         get {
             let chunkSizeStr = chunkSize?.description ?? "None"
@@ -1416,6 +1493,31 @@ public class ArraysCache: BaseKVCache {
         let new = ArraysCache(size: cache.count)
         copyContents(to: new)
         return new
+    }
+
+    public override func detachedCopy() throws -> any KVCache {
+        let new = detachedShell()
+        try copyContentsDetached(to: new)
+        return new
+    }
+
+    /// The empty instance a detached copy is built into.
+    ///
+    /// Overridden by ``MambaCache`` so the clone keeps its concrete type: models
+    /// switch on the cache class, and a clone that changed type would take a
+    /// different branch on the next turn.
+    internal func detachedShell() -> ArraysCache {
+        ArraysCache(size: cache.count)
+    }
+
+    internal func copyContentsDetached(to new: ArraysCache) throws {
+        // Slots are copied one by one rather than through `state`: `state` drops
+        // `nil` slots, so a cache that has not written all of its arrays yet
+        // would come back shorter than it went in.
+        new.cache = try cache.map { slot in try slot.map(KVCacheDetachment.owningCopy) }
+        new.offset = self.offset
+        new.leftPadding = try leftPadding.map(KVCacheDetachment.owningCopy)
+        new.lengths = try lengths.map(KVCacheDetachment.owningCopy)
     }
 
     internal func copyContents(to new: ArraysCache) {
@@ -1629,6 +1731,21 @@ public class MambaCache: ArraysCache {
         copyContents(to: new)
         return new
     }
+
+    public override func detachedCopy() throws -> any KVCache {
+        // A speculative pass keeps an older state inside the cache. A clone taken
+        // mid-pass would look consistent and would have lost the checkpoint the
+        // pass is supposed to be able to roll back to.
+        guard !hasSpeculativeCheckpoint else {
+            throw DetachedForkError.invalidState(
+                "MambaCache holds a speculative checkpoint; detach outside the verification pass")
+        }
+        return try super.detachedCopy()
+    }
+
+    internal override func detachedShell() -> ArraysCache {
+        MambaCache()
+    }
 }
 
 /// Composite cache that manages multiple sub-caches
@@ -1674,6 +1791,19 @@ public class CacheList: BaseKVCache {
     public override func copy() -> any KVCache {
         let copiedCaches = caches.map { $0.copy() }
         let new = CacheList(caches: copiedCaches)
+        return new
+    }
+
+    /// Detaches every child individually, then rebuilds the composite.
+    ///
+    /// Not `detachedClone()`: the flattened `state` this composite exposes cannot
+    /// represent a child whose slot count differs from its array count (an
+    /// `ArraysCache` with unwritten slots), so distributing copies through it
+    /// could reshape a child instead of copying it.
+    public override func detachedCopy() throws -> any KVCache {
+        let detached = try caches.map { try KVCacheDetachment.detachedCopy(of: $0) }
+        let new = CacheList(caches: detached)
+        new.offset = self.offset
         return new
     }
 

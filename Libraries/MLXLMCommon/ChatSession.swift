@@ -451,6 +451,62 @@ public final class ChatSession {
         return try await model.cacheStatus(parameters: parameters)
     }
 
+    /// Sample the storage backing this session's realized KV cache.
+    ///
+    /// The cache itself stays private: this returns addresses and array
+    /// metadata, never the arrays. Sampling forces `eval()` (an address needs
+    /// realized storage) and therefore synchronizes the cache for the duration
+    /// of the read.
+    ///
+    /// An address is an observation with a lifetime, not an identity: compare
+    /// two samples taken while both sessions are alive (parent vs fork child),
+    /// and never persist one. See ``KVStorageSample`` for what it does and does
+    /// not prove.
+    ///
+    /// - Parameter includeValues: also digest each array's values. Off by
+    ///   default because it copies and hashes every cached byte; on when the
+    ///   question is whether one branch's write changed what another branch
+    ///   reads, which addresses alone cannot answer.
+    /// - Parameter valueRows: digest only the first `valueRows` rows of the
+    ///   sequence axis. A write changes how many rows are visible, so whole-
+    ///   array digests from before and after such a write are not comparable on
+    ///   the rows they share; windowing both samples to the same row count makes
+    ///   "did the values on those rows change" answerable. The window is a view
+    ///   of the live cache, never a stored copy.
+    public func probeKVStorage(
+        includeValues: Bool = false, valueRows: Int? = nil
+    ) async -> KVStorageSample {
+        await cache.read { cache in
+            guard case .kvcache(let stored) = cache else {
+                return KVStorageProbe.sample(
+                    main: [], draft: [], processedTokenCount: nil,
+                    includeValues: includeValues, valueRows: valueRows)
+            }
+            return KVStorageProbe.sample(
+                main: stored.main.cache,
+                draft: stored.draft?.cache ?? [],
+                processedTokenCount: stored.main.processedTokenCount,
+                includeValues: includeValues, valueRows: valueRows)
+        }
+    }
+
+    /// Observe the ownership of every array in this session's KV cache.
+    ///
+    /// Non-holding: the returned snapshot keeps weak references only
+    /// (`std::weak_ptr<Data>` behind an opaque handle), so it stays valid and
+    /// harmless across a source-session release. It answers "who still owns that
+    /// allocation", not "how many bytes" and not "which pages".
+    public func watchKVOwnership() async -> KVOwnershipSnapshot {
+        await cache.read { cache in
+            guard case .kvcache(let stored) = cache else {
+                return KVOwnershipSnapshot(entries: [], processedTokenCount: nil)
+            }
+            return KVOwnershipProbe.snapshot(
+                main: stored.main.cache, draft: stored.draft?.cache ?? [],
+                processedTokenCount: stored.main.processedTokenCount)
+        }
+    }
+
     /// Initialize the `ChatSession`.
     ///
     /// - Parameters:
@@ -1787,6 +1843,124 @@ public final class ChatSession {
             SendableBox(history.consume().map(cache.replacingTranscript) ?? cache.copy())
         }.consume()
         return ChatSession(forking: self, cache: forked)
+    }
+
+    /// Fork with storage the source does not read: an eager, verified deep copy.
+    ///
+    /// ``fork(history:)`` hands the child slices of the source's KV buffers. That
+    /// is enough for two live branches -- neither sees the other's writes -- and
+    /// not enough for a host that intends to retire the source: the survivor
+    /// still holds the source's allocations, so those pages cannot be released
+    /// while it lives. This variant copies every visible KV array into a buffer of
+    /// its own, forces the copies to be evaluated, and verifies that they present
+    /// the same values while reading different storage. Only then does it return.
+    ///
+    /// Call it only where that guarantee is needed. It buys determinism with an
+    /// allocation and a full copy of the cache; ``fork(history:)`` is unchanged
+    /// and stays the default for branches that keep their source alive.
+    ///
+    /// - Parameter history: an optional transcript to pair with the copy, exactly
+    ///   as ``fork(history:)`` does. A transcript carrying media starts cold there,
+    ///   so there is no cache to detach and this throws rather than falling back.
+    /// - Returns: the detached session, plus the report the verification produced
+    ///   (array count, bytes copied, values matched, addresses separated).
+    /// - Throws: ``DetachedForkError``. There is no fallback path: a caller that
+    ///   asked for detached storage never receives a shared one.
+    public nonisolated(nonsending) func forkDetached(
+        history: [Chat.Message]? = nil
+    ) async throws -> (session: ChatSession, report: DetachedForkReport) {
+        let history = SendableBox(history)
+        let prepared = try await cache.read { cache -> SendableBox<(Cache, DetachedForkReport)> in
+            let resolved: Cache = history.consume().map(cache.replacingTranscript) ?? cache
+            guard case .kvcache(let stored) = resolved else {
+                throw DetachedForkError.noRealizedCache(
+                    "the source holds a transcript, not a realized KV cache")
+            }
+            guard !stored.main.roundIsOpen, stored.draft?.roundIsOpen != true else {
+                throw DetachedForkError.invalidState("a staged round is open on the source cache")
+            }
+
+            // Copy -> realize -> verify, in that order. Nothing is handed back
+            // before the last step passes, so a half-detached cache cannot exist
+            // outside this scope.
+            let main = try KVCacheDetachment.detachedCopy(of: stored.main.cache)
+            let draft = try stored.draft.map { try KVCacheDetachment.detachedCopy(of: $0.cache) }
+            KVCacheDetachment.evaluate(main)
+            if let draft {
+                KVCacheDetachment.evaluate(draft)
+            }
+
+            let mainReport = try KVCacheDetachment.verify(
+                source: stored.main.cache, detached: main, tag: "main",
+                sourceTokenCount: stored.main.processedTokenCount,
+                detachedTokenCount: stored.main.processedTokenCount)
+            var draftReport: DetachedForkReport.Section?
+            if let draft, let storedDraft = stored.draft {
+                draftReport = try KVCacheDetachment.verify(
+                    source: storedDraft.cache, detached: draft, tag: "draft",
+                    sourceTokenCount: storedDraft.processedTokenCount,
+                    detachedTokenCount: storedDraft.processedTokenCount)
+            }
+
+            var draftStorage: KVCacheStorage?
+            if let draft, let storedDraft = stored.draft {
+                draftStorage = KVCacheStorage(
+                    draft, plan: storedDraft.plan,
+                    processedTokenCount: storedDraft.processedTokenCount)
+            }
+            let detached = RealizedCache(
+                main: KVCacheStorage(
+                    main, plan: stored.main.plan,
+                    processedTokenCount: stored.main.processedTokenCount),
+                draft: draftStorage,
+                state: stored.state,
+                conversation: stored.conversation)
+            return SendableBox(
+                (
+                    Cache.kvcache(detached),
+                    DetachedForkReport(main: mainReport, draft: draftReport)
+                ))
+        }.consume()
+        return (ChatSession(forking: self, cache: prepared.0), prepared.1)
+    }
+
+    /// Re-run the detached-fork gate against another session.
+    ///
+    /// ``forkDetached(history:)`` already ran this before it returned, so a host
+    /// normally only reads the report. This entry point exists for the two other
+    /// uses: re-checking the pair a host actually holds, and proving the negative
+    /// case -- a plain ``fork(history:)`` shares storage and must NOT pass.
+    ///
+    /// Both sessions are read, never mutated, and are expected to be idle; the
+    /// source's lock is not held across the comparison.
+    @_spi(DetachedForkVerification)
+    public nonisolated(nonsending) func verifyStorageSeparation(
+        from source: ChatSession
+    ) async throws -> DetachedForkReport {
+        let sourceCache = await source.cache.read { SendableBox($0) }
+        return try await cache.read { cache -> SendableBox<DetachedForkReport> in
+            let sourceValue = sourceCache.consume()
+            guard case .kvcache(let detachedStored) = cache else {
+                throw DetachedForkError.noRealizedCache(
+                    "the detached session has no realized KV cache")
+            }
+            guard case .kvcache(let sourceStored) = sourceValue else {
+                throw DetachedForkError.noRealizedCache("the source session has no realized KV cache")
+            }
+            let main = try KVCacheDetachment.verify(
+                source: sourceStored.main.cache, detached: detachedStored.main.cache,
+                tag: "main",
+                sourceTokenCount: sourceStored.main.processedTokenCount,
+                detachedTokenCount: detachedStored.main.processedTokenCount)
+            var draft: DetachedForkReport.Section?
+            if let sourceDraft = sourceStored.draft, let detachedDraft = detachedStored.draft {
+                draft = try KVCacheDetachment.verify(
+                    source: sourceDraft.cache, detached: detachedDraft.cache, tag: "draft",
+                    sourceTokenCount: sourceDraft.processedTokenCount,
+                    detachedTokenCount: detachedDraft.processedTokenCount)
+            }
+            return SendableBox(DetachedForkReport(main: main, draft: draft))
+        }.consume()
     }
 
     /// Wait for exclusive access to the KVCache.
