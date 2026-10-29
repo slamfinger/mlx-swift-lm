@@ -414,6 +414,36 @@ public final class ChatSession {
         (@Sendable (_ promptTokenIds: [Int]) -> (
             cache: PromptCacheSnapshot, matchedTokenCount: Int
         )?)?
+
+    /// Full rendered prompt token ids of the turn in flight, captured at the
+    /// cache-reuse policy boundary -- the same array the ledger record consumes.
+    ///
+    /// A turn interrupted inside the prefill loop never reaches
+    /// `KVCacheStorage.commitProcessedTokens`, so its logical timeline lags the
+    /// rows the model did write. ``interruptedPrefixBoundary()`` proves that
+    /// boundary against this array; nothing else reads it.
+    ///
+    /// The generation runs in a `Task` whose capture list cannot name `self`
+    /// (`ChatSession` is not `Sendable`), so the tokens travel through this
+    /// reference: written from inside the task, read back from the caller's.
+    private let turnRenderedPromptTokens = RenderedPromptTokens()
+    private final class RenderedPromptTokens: @unchecked Sendable {
+        private let lock = NSLock()
+        private var ids: [Int] = []
+
+        var value: [Int] {
+            get {
+                lock.lock()
+                defer { lock.unlock() }
+                return ids
+            }
+            set {
+                lock.lock()
+                ids = newValue
+                lock.unlock()
+            }
+        }
+    }
     private let loadedDraftModel: SerialAccessContainer<ModelContainer?>
     public var processing: UserInput.Processing
     public var generateParameters: GenerateParameters
@@ -1033,7 +1063,7 @@ public final class ChatSession {
                 model,
                 instructions, processing, tools, toolDispatch,
                 additionalContext, cache, loadedDraftModel, generateParameters, components,
-                speculativeDecoding
+                speculativeDecoding, turnRenderedPromptTokens
             ] in
             do {
                 try await cache.update { cache in
@@ -1221,6 +1251,7 @@ public final class ChatSession {
                         if var currentConversation = conversation {
                             let promptTokenIds = input.text.tokens.asArray(Int.self)
                             turnPromptTokenIds = promptTokenIds
+                            turnRenderedPromptTokens.value = promptTokenIds
                             if currentConversation.ledgerBootstrapPending {
                                 // The snapshot stores KV/state but not the private token ledger.
                                 // For a transcript-aware restore, the first rendered prompt is
@@ -1359,7 +1390,9 @@ public final class ChatSession {
                                     let seeded = hook(promptTokenIds)
                                     if let (snapshot, matched) = seeded,
                                         matched > 0, matched < promptTokenIds.count,
-                                        snapshot.cache.count == kvCache.cache.count
+                                        snapshot.cache.count == kvCache.cache.count,
+                                        Self.snapshotRepresentsPrefix(
+                                            snapshot, live: kvCache.cache, matched: matched)
                                     {
                                         // The seed physically advances every layer by
                                         // `matched` rows; the logical timeline moves with
@@ -1922,6 +1955,390 @@ public final class ChatSession {
                 throw ChatSessionError.noCacheAvailable
             }
         }
+    }
+
+    // MARK: - Interrupted-turn prefix boundary (SIMIGO17 #136)
+
+    /// The token boundary an interrupted turn provably reached, with the cache
+    /// rows that represent it.
+    ///
+    /// The layers are independent copies: the capturing session stays free to
+    /// clear, keep generating or die, and none of that writes through into this
+    /// snapshot. Deciding whether to consume it remains the caller's job.
+    public struct InterruptedPrefixBoundary {
+        public let snapshot: PromptCacheSnapshot
+        /// The exact tokens these rows represent -- the interrupted turn's
+        /// rendered prompt truncated to ``tokenCount``.
+        public let tokens: [Int]
+        /// Rows every layer agrees it holds.
+        public let tokenCount: Int
+        /// Bytes held by the copied layers, for the holder's memory budget.
+        public let bytes: Int
+        public let attentionLayerCount: Int
+        public let recurrentLayerCount: Int
+        /// Leaf indices whose cache is full attention -- the layers that carry
+        /// the position. Every other leaf is recurrent and travels verbatim:
+        /// its `offset` is copied but is not a position witness.
+        public let attentionLayers: [Int]
+
+        /// Hand one consumer an independent copy of the source representation.
+        ///
+        /// A pool entry outlives the session that proved it, so whatever the
+        /// consumer adopts has to be re-proved against what is actually held --
+        /// and re-copied, because sharing the stored arrays would let the
+        /// consumer's next `update` write through the source.
+        ///
+        /// The two layer families get different rules because they hold
+        /// different facts. Attention layers own the position: their rows and
+        /// offset must both equal the boundary, and since `KVCacheSimple.copy()`
+        /// carries state but NOT `offset`, the copy's offset is written back and
+        /// re-read before it leaves. Recurrent layers own no row counter at all
+        /// (the GDN forward never advances `MambaCache.offset`), so asserting a
+        /// boundary offset on them would refuse every hybrid model; they are
+        /// verified for state fidelity instead -- all slots present on both
+        /// sides, equal slot count, offset carried exactly as it came.
+        public func clonedForAdoption() throws -> PromptCacheSnapshot {
+            let leaves = KVCacheTree.leaves(in: snapshot.cache)
+            let leafCount = attentionLayerCount + recurrentLayerCount
+            guard leafCount > 0, leaves.count == leafCount else {
+                throw InterruptedPrefixBoundaryError.nestedTopology(
+                    layerCount: snapshot.cache.count, leafCount: leaves.count)
+            }
+            let attention = Set(attentionLayers)
+            var copies: [any KVCache] = []
+            copies.reserveCapacity(leaves.count)
+            for (index, leaf) in leaves.enumerated() {
+                let source = leaf.cache
+                let sourceState = source.state
+                guard !sourceState.isEmpty else {
+                    throw InterruptedPrefixBoundaryError.copiedLayerDisagreed(
+                        layer: index, rows: 0, boundary: tokenCount)
+                }
+                if attention.contains(index) {
+                    guard source.maxSize == nil, source.offset == tokenCount,
+                        sourceState.first?.dim(2) == tokenCount
+                    else {
+                        throw InterruptedPrefixBoundaryError.copiedLayerDisagreed(
+                            layer: index, rows: sourceState.first?.dim(2) ?? 0,
+                            boundary: tokenCount)
+                    }
+                    let copy = source.copy()
+                    guard let writable = copy as? BaseKVCache else {
+                        throw InterruptedPrefixBoundaryError.attentionOffsetUnwritable(
+                            layer: index)
+                    }
+                    writable.offset = tokenCount
+                    let rows = writable.state.first?.dim(2) ?? 0
+                    guard writable.offset == tokenCount, rows == tokenCount else {
+                        throw InterruptedPrefixBoundaryError.copiedLayerDisagreed(
+                            layer: index, rows: rows, boundary: tokenCount)
+                    }
+                    copies.append(copy)
+                } else {
+                    guard case .recurrent = leaf.kind, let arrays = source as? ArraysCache
+                    else {
+                        throw InterruptedPrefixBoundaryError.recurrentStateMissing(
+                            layer: index, slots: -1, present: sourceState.count)
+                    }
+                    guard let copied = arrays.copy() as? ArraysCache else {
+                        throw InterruptedPrefixBoundaryError.recurrentStateMissing(
+                            layer: index, slots: arrays.slotCount, present: -1)
+                    }
+                    let copiedState = copied.state
+                    guard arrays.slotCount > 0, sourceState.count == arrays.slotCount,
+                        copiedState.count == arrays.slotCount, copied.offset == arrays.offset,
+                        copiedState.count == sourceState.count,
+                        zip(copiedState, sourceState).allSatisfy({ $0.shape == $1.shape })
+                    else {
+                        throw InterruptedPrefixBoundaryError.recurrentCopyDisagreed(
+                            layer: index, slots: arrays.slotCount, present: copiedState.count)
+                    }
+                    let lengths = arrays.lengthsValues ?? []
+                    let padding = arrays.leftPaddingValues ?? []
+                    guard lengths.allSatisfy({ $0 == 0 }), padding.allSatisfy({ $0 == 0 }) else {
+                        throw InterruptedPrefixBoundaryError.recurrentBatchNotSettled(
+                            layer: index, lengths: lengths, leftPadding: padding)
+                    }
+                    copies.append(copied)
+                }
+            }
+            // Realize the copies now: the tensors would otherwise be evaluated
+            // lazily against buffers the interrupted session may already own.
+            eval(copies.flatMap { $0.state })
+            return PromptCacheSnapshot(cache: copies, metadata: [:], state: nil)
+        }
+    }
+
+    /// Why an interrupted turn could not prove a reusable prefix boundary.
+    ///
+    /// Each case is a refusal to guess: the caller must fall back to a cold
+    /// prefill rather than adopt rows whose extent it cannot name.
+    public enum InterruptedPrefixBoundaryError: Error, Equatable, CustomStringConvertible {
+        case noRealizedCache
+        case noRenderedPrompt
+        case stagedRoundOpen
+        case modelStateCarried
+        case speculativeDraftPresent
+        case nestedTopology(layerCount: Int, leafCount: Int)
+        case noAttentionLayer
+        case attentionOffsetsDiverged(offsets: [Int])
+        case attentionRowsShort(layer: Int, rows: Int, boundary: Int)
+        case windowedAttention(layer: Int, maxSize: Int)
+        case recurrentStateMissing(layer: Int, slots: Int, present: Int)
+        case recurrentCopyDisagreed(layer: Int, slots: Int, present: Int)
+        case ledgerDisagrees(committed: Int, ledger: Int)
+        case priorCommittedRows(committed: Int)
+        case noConversationLedger
+        case recurrentBatchNotSettled(layer: Int, lengths: [Int], leftPadding: [Int])
+        case trailingRecurrentLayers(count: Int)
+        case boundaryExceedsPrompt(boundary: Int, promptTokens: Int)
+        case attentionOffsetUnwritable(layer: Int)
+        case copiedLayerDisagreed(layer: Int, rows: Int, boundary: Int)
+
+        public var description: String {
+            switch self {
+            case .noRealizedCache: "no realized cache"
+            case .noRenderedPrompt: "no rendered prompt for the turn in flight"
+            case .stagedRoundOpen: "a staged cache round is open"
+            case .modelStateCarried: "the cache carries model state that cannot be sliced"
+            case .speculativeDraftPresent: "a draft cache would be left behind"
+            case .nestedTopology(let layers, let leaves):
+                "nested cache topology (layers=\(layers) leaves=\(leaves))"
+            case .noAttentionLayer: "no attention layer to anchor the boundary"
+            case .attentionOffsetsDiverged(let offsets):
+                "attention offsets disagree \(offsets)"
+            case .attentionRowsShort(let layer, let rows, let boundary):
+                "layer \(layer) holds \(rows) rows, below boundary \(boundary)"
+            case .windowedAttention(let layer, let maxSize):
+                "layer \(layer) is windowed (maxSize=\(maxSize))"
+            case .recurrentStateMissing(let layer, let slots, let present):
+                "recurrent layer \(layer) holds \(present)/\(slots) state slots"
+            case .recurrentCopyDisagreed(let layer, let slots, let present):
+                "copied recurrent layer \(layer) disagrees with its source (\(present)/\(slots) slots or shapes)"
+            case .ledgerDisagrees(let committed, let ledger):
+                "committed rows (\(committed)) disagree with the token ledger (\(ledger))"
+            case .priorCommittedRows(let committed):
+                "the cache already held \(committed) committed rows at turn start"
+            case .noConversationLedger:
+                "no conversation ledger, so the cached rows cannot be named"
+            case .recurrentBatchNotSettled(let layer, let lengths, let leftPadding):
+                "recurrent layer \(layer) batch unsettled lengths=\(lengths) padding=\(leftPadding)"
+            case .trailingRecurrentLayers(let count):
+                "\(count) recurrent layers trail the last attention layer"
+            case .boundaryExceedsPrompt(let boundary, let promptTokens):
+                "boundary \(boundary) exceeds the rendered prompt (\(promptTokens))"
+            case .attentionOffsetUnwritable(let layer):
+                "layer \(layer) does not expose a writable offset"
+            case .copiedLayerDisagreed(let layer, let rows, let boundary):
+                "copied layer \(layer) holds \(rows) rows, expected \(boundary)"
+            }
+        }
+    }
+
+    /// Prove the boundary this session's cache reached when a turn was
+    /// interrupted inside the prefill loop.
+    ///
+    /// `prefill.progress` reports positions the driver intended to reach, which
+    /// is not evidence about the cache. This derives the boundary from the
+    /// layers themselves and refuses unless every attention layer holds the same
+    /// nonzero offset and that many rows, every recurrent layer carries settled
+    /// state, and the session's own ledger agrees that nothing was committed
+    /// before this turn. Attention offsets are the position authority -- hybrid
+    /// models such as Qwen3.5 compute RoPE positions from the full-attention
+    /// cache.
+    ///
+    /// Why the attention offsets witness the recurrent layers too: the chunk
+    /// loop's only cancellation point is at the top of the loop, before a chunk
+    /// forward runs (`PrefillParameters.forEachChunk`), and there is no check
+    /// inside a forward or between layer updates. So a chunk lands on all 40
+    /// layers or on none, and equal attention offsets name the number of chunks
+    /// that landed. That is what makes this a proof about the cache rather than
+    /// a guess from the physical presence of rows -- but it holds only while
+    /// every layer advanced through the same forwards as the attention layers,
+    /// hence the two refusals below.
+    ///
+    /// - Important: Recurrent layers keep no row counter (`MambaCache.offset` is
+    ///   never advanced by the GDN forward), so their agreement with the
+    ///   boundary is only checkable when no recurrent layer trails the last
+    ///   attention layer in the stack; otherwise this throws
+    ///   ``InterruptedPrefixBoundaryError/trailingRecurrentLayers(count):``.
+    /// - Important: The ledger must read zero. Rows only name a prefix of THIS
+    ///   turn's rendered prompt when the turn started on an empty cache; with
+    ///   anything already committed the boundary would point at tokens the
+    ///   rendered prompt never contained.
+    public func interruptedPrefixBoundary() async throws -> sending InterruptedPrefixBoundary {
+        let promptTokens = turnRenderedPromptTokens.value
+        guard !promptTokens.isEmpty else {
+            throw InterruptedPrefixBoundaryError.noRenderedPrompt
+        }
+        // The copies are owned by the `cache.read` region, so they travel back
+        // through the same one-shot box the fork uses for `prepare(input:)`.
+        return try await cache.read { container -> SendableBox<InterruptedPrefixBoundary> in
+            guard case .kvcache(let stored) = container else {
+                throw InterruptedPrefixBoundaryError.noRealizedCache
+            }
+            return try Self.proveInterruptedBoundary(
+                main: stored.main, draft: stored.draft, modelState: stored.state,
+                ledger: stored.conversation?.cachedTokens,
+                promptTokens: promptTokens)
+        }.consume()
+    }
+
+    private static func proveInterruptedBoundary(
+        main: KVCacheStorage, draft: KVCacheStorage?, modelState: LMOutput.State?,
+        ledger: [Int]?, promptTokens: [Int]
+    ) throws -> SendableBox<InterruptedPrefixBoundary> {
+        guard modelState == nil else { throw InterruptedPrefixBoundaryError.modelStateCarried }
+        guard draft == nil else { throw InterruptedPrefixBoundaryError.speculativeDraftPresent }
+        guard !main.roundIsOpen else { throw InterruptedPrefixBoundaryError.stagedRoundOpen }
+        // The ledger is the session's own account of the tokens it committed. A
+        // turn cancelled inside the prefill loop never reaches the single commit
+        // site, so both sides read zero -- and only then do the cached rows live
+        // in THIS turn's rendered-prompt index space. If anything was committed
+        // before the turn (an extend, or a pool-seeded session) those rows sit in
+        // front of the chunk the loop finished, and naming the prefix
+        // `promptTokens[..<boundary]` would be a guess about tokens the cache
+        // never held.
+        let committed = main.processedTokenCount
+        guard let ledger else { throw InterruptedPrefixBoundaryError.noConversationLedger }
+        guard committed == ledger.count else {
+            throw InterruptedPrefixBoundaryError.ledgerDisagrees(
+                committed: committed, ledger: ledger.count)
+        }
+        guard committed == 0 else {
+            throw InterruptedPrefixBoundaryError.priorCommittedRows(committed: committed)
+        }
+        let layers = main.cache
+        guard !layers.isEmpty else { throw InterruptedPrefixBoundaryError.noRealizedCache }
+        let leaves = KVCacheTree.leaves(in: layers)
+        let topologyError = InterruptedPrefixBoundaryError.nestedTopology(
+            layerCount: layers.count, leafCount: leaves.count)
+        guard leaves.count == layers.count else { throw topologyError }
+
+        var attention: [(layer: Int, offset: Int)] = []
+        var lastAttentionLayer = -1
+        for (index, leaf) in leaves.enumerated() where leaf.isAttentionCache {
+            if let maxSize = leaf.cache.maxSize {
+                throw InterruptedPrefixBoundaryError.windowedAttention(
+                    layer: index, maxSize: maxSize)
+            }
+            attention.append((index, leaf.cache.offset))
+            lastAttentionLayer = index
+        }
+        guard !attention.isEmpty else { throw InterruptedPrefixBoundaryError.noAttentionLayer }
+        let offsets = attention.map(\.offset)
+        let boundary = offsets.min() ?? 0
+        guard boundary > 0, offsets.allSatisfy({ $0 == boundary }) else {
+            throw InterruptedPrefixBoundaryError.attentionOffsetsDiverged(offsets: offsets)
+        }
+        // A recurrent layer after the last attention layer has no row counter, so
+        // its share of a partially executed chunk would be unverifiable.
+        guard lastAttentionLayer == leaves.count - 1 else {
+            throw InterruptedPrefixBoundaryError.trailingRecurrentLayers(
+                count: leaves.count - 1 - lastAttentionLayer)
+        }
+        guard boundary <= promptTokens.count else {
+            throw InterruptedPrefixBoundaryError.boundaryExceedsPrompt(
+                boundary: boundary, promptTokens: promptTokens.count)
+        }
+        for entry in attention {
+            let rows = leaves[entry.layer].cache.state.first?.dim(2) ?? 0
+            guard rows >= boundary else {
+                throw InterruptedPrefixBoundaryError.attentionRowsShort(
+                    layer: entry.layer, rows: rows, boundary: boundary)
+            }
+        }
+        for (index, leaf) in leaves.enumerated() where !leaf.isAttentionCache {
+            guard case .recurrent = leaf.kind else { throw topologyError }
+            guard let arrays = leaf.cache as? ArraysCache else {
+                throw InterruptedPrefixBoundaryError.recurrentStateMissing(
+                    layer: index, slots: -1, present: -1)
+            }
+            let present = arrays.state.count
+            guard arrays.slotCount > 0, present == arrays.slotCount else {
+                throw InterruptedPrefixBoundaryError.recurrentStateMissing(
+                    layer: index, slots: arrays.slotCount, present: present)
+            }
+            let lengths = arrays.lengthsValues ?? []
+            let padding = arrays.leftPaddingValues ?? []
+            guard lengths.allSatisfy({ $0 == 0 }), padding.allSatisfy({ $0 == 0 }) else {
+                throw InterruptedPrefixBoundaryError.recurrentBatchNotSettled(
+                    layer: index, lengths: lengths, leftPadding: padding)
+            }
+        }
+
+        // Realize queued writes before the copies leave the container: the
+        // snapshot is read by a different session, possibly after this one dies.
+        eval(layers.flatMap { $0.state })
+        // Independent copies, then the boundary written back onto them.
+        // `KVCacheSimple.copy()` carries state and step but not `offset` (only
+        // `ArraysCache.copyContents(to:)` copies it), and an adopted layer whose
+        // offset disagrees with its rows would prefill from position 0 over the
+        // rows it already holds. Recurrent offsets are copied by `copyContents`
+        // and must NOT be rewritten: they are not the position authority.
+        let copies = main.copy().cache
+        for entry in attention {
+            guard let writable = copies[entry.layer] as? BaseKVCache else {
+                throw InterruptedPrefixBoundaryError.attentionOffsetUnwritable(
+                    layer: entry.layer)
+            }
+            writable.offset = boundary
+            let rows = copies[entry.layer].state.first?.dim(2) ?? 0
+            guard copies[entry.layer].offset == boundary, rows == boundary else {
+                throw InterruptedPrefixBoundaryError.copiedLayerDisagreed(
+                    layer: entry.layer, rows: rows, boundary: boundary)
+            }
+        }
+        let bytes = copies.reduce(0) { total, layer in
+            total + layer.state.reduce(0) { $0 + $1.nbytes }
+        }
+        return SendableBox(
+            InterruptedPrefixBoundary(
+                snapshot: PromptCacheSnapshot(cache: copies, metadata: [:], state: nil),
+                tokens: Array(promptTokens[..<boundary]),
+                tokenCount: boundary,
+                bytes: bytes,
+                attentionLayerCount: attention.count,
+                recurrentLayerCount: leaves.count - attention.count,
+                attentionLayers: attention.map(\.layer)))
+    }
+
+    /// Whether a candidate snapshot really represents the first `matched` rows
+    /// for the topology about to consume it.
+    ///
+    /// Adoption replaces the live layers and moves the logical timeline to
+    /// `matched` in one step, so a snapshot whose own layers disagree with that
+    /// number would leave the session crediting rows it cannot name. Slots must
+    /// match by type (a recurrent slot swapped for an attention slot would
+    /// silently drop state), attention slots must sit exactly at `matched` with
+    /// enough rows behind them, and recurrent slots must carry settled state.
+    static func snapshotRepresentsPrefix(
+        _ snapshot: PromptCacheSnapshot, live: [KVCache], matched: Int
+    ) -> Bool {
+        guard matched > 0, snapshot.cache.count == live.count, !live.isEmpty else { return false }
+        let adopted = KVCacheTree.leaves(in: snapshot.cache)
+        let liveLeaves = KVCacheTree.leaves(in: live)
+        guard adopted.count == liveLeaves.count, adopted.count > 0,
+            adopted.count == snapshot.cache.count
+        else { return false }
+        for (index, leaf) in adopted.enumerated() {
+            guard type(of: leaf.cache) == type(of: liveLeaves[index].cache) else { return false }
+            if leaf.isAttentionCache {
+                guard leaf.cache.maxSize == nil, leaf.cache.offset == matched else { return false }
+                guard let rows = leaf.cache.state.first?.dim(2), rows >= matched else { return false }
+            } else {
+                guard case .recurrent = leaf.kind else { return false }
+                guard let arrays = leaf.cache as? ArraysCache,
+                    arrays.slotCount > 0, arrays.state.count == arrays.slotCount
+                else { return false }
+                let lengths = arrays.lengthsValues ?? []
+                let padding = arrays.leftPaddingValues ?? []
+                guard lengths.allSatisfy({ $0 == 0 }), padding.allSatisfy({ $0 == 0 }) else {
+                    return false
+                }
+            }
+        }
+        return true
     }
 }
 
