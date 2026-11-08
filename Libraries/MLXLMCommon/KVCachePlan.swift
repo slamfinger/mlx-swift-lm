@@ -167,8 +167,17 @@ package final class KVCacheStorage {
             processedTokenCount ?? Self.inferProcessedTokenCount(from: cache)
     }
 
-    package func replace(with cache: [KVCache]) {
+    /// Replace the cache entries, optionally advancing the logical timeline to
+    /// match. Seed paths (cross-session prefix adoption) physically advance the
+    /// entries by the seeded rows; the timeline must move with them, otherwise
+    /// `processedTokenCount` diverges from the layer offsets and the ledger
+    /// reconciliation at turn end wipes the conversation transcript.
+    package func replace(with cache: [KVCache], processedTokenCount newCount: Int? = nil) {
         self.cache = cache
+        if let newCount {
+            precondition(newCount >= 0, "Processed token count cannot be negative")
+            self.processedTokenCount = newCount
+        }
     }
 
     /// Commit tokens after a successful model evaluation.

@@ -609,6 +609,38 @@ public class Qwen3NextModelInner: Module {
         return norm(hiddenStates)
     }
 
+    /// Execute ONLY `layerRange` of the decoder stack over hidden states that
+    /// are already embedded (and, for ranges after the first, already
+    /// processed by earlier layers). Mask and cache handling match `forward`.
+    ///
+    /// SimiGo Runtime residency streaming uses this surface to materialize a
+    /// layer-group's weights just before its layers execute and release them
+    /// afterwards; semantic authority (identity/lineage/continuation) stays
+    /// in the Runtime.
+    func forwardLayerRange(
+        _ hiddenStates: MLXArray,
+        layerRange: Range<Int>,
+        cache: [KVCache?]? = nil
+    ) -> MLXArray {
+        var current = hiddenStates
+
+        var cacheArray = cache
+        if cacheArray == nil {
+            cacheArray = Array(repeating: nil as KVCache?, count: layers.count)
+        }
+        let faMask = createAttentionMask(h: current, cache: cacheArray?[faIdx])
+        let ssmMask = createSSMMask(h: current, cache: cacheArray?[ssmIdx] as? MambaCache)
+
+        for i in layerRange {
+            let layer = layers[i]
+            let mask = layer.isLinear ? ssmMask : nil
+            let attnMask = layer.isLinear ? MLXFast.ScaledDotProductAttentionMaskMode.none : faMask
+            current = layer(
+                current, attentionMask: attnMask, ssmMask: mask, cache: cacheArray?[i])
+        }
+        return current
+    }
+
     // MARK: - Compiled decode segments
 
     /// Flat segment arguments keep mutable cache state outside MLX's compiled
@@ -771,6 +803,35 @@ public class Qwen3NextModel: Module, LLMModel, KVCacheDimensionProvider {
             out = model.embedTokens.asLinear(out)
         }
         return out
+    }
+
+    // MARK: - Segment-execution surface (E3 Backend API)
+
+    /// Embed token inputs (segment streaming step 1).
+    public func embedInputs(_ tokenIDs: MLXArray) -> MLXArray {
+        model.embedTokens(tokenIDs)
+    }
+
+    /// Execute ONLY `layerRange` of the decoder stack (segment streaming
+    /// step 2; call once per layer range with the runtime-managed hidden
+    /// states). Physical execution slice only -- Execution State semantics
+    /// remain in the SimiGo Runtime.
+    public func forwardLayerRange(
+        _ hiddenStates: MLXArray,
+        layerRange: Range<Int>,
+        cache: [KVCache?]? = nil
+    ) -> MLXArray {
+        model.forwardLayerRange(hiddenStates, layerRange: layerRange, cache: cache)
+    }
+
+    /// Final norm + LM head projection (segment streaming step 3). Mirrors
+    /// `forward`'s projection so tied-embedding checkpoints still project.
+    public func projectOutput(_ hiddenStates: MLXArray) -> MLXArray {
+        let normed = model.norm(hiddenStates)
+        if let lmHead {
+            return lmHead(normed)
+        }
+        return model.embedTokens.asLinear(normed)
     }
 
     public func newCache(parameters: GenerateParameters?) throws -> [KVCache] {

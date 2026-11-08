@@ -2310,7 +2310,10 @@ public func loadPromptCache(
 /// Load a prompt cache and its associated model state from a file.
 ///
 /// The arrays are read before this returns, so the file can be overwritten or removed afterwards.
-public func loadPromptCacheSnapshot(url: URL) throws -> PromptCacheSnapshot {
+public func loadPromptCacheSnapshot(
+    url: URL,
+    materializeArrays: Bool = false
+) throws -> PromptCacheSnapshot {
     var (arrays, metadata) = try loadArraysAndMetadata(url: url)
     // A loaded array reads the file only when it is evaluated.
     eval(arrays.values)
@@ -2350,7 +2353,31 @@ public func loadPromptCacheSnapshot(url: URL) throws -> PromptCacheSnapshot {
         caches.append(cache)
     }
 
+    if materializeArrays {
+        materializeSnapshotCaches(&caches)
+    }
+
     return PromptCacheSnapshot(cache: caches, metadata: userMetadata, state: state)
+}
+
+/// Copy a loaded snapshot's arrays out of any backing mmap into freshly
+/// materialized buffers. Arrays loaded from safetensors reference the file's
+/// mmap; the first prefill over a restored cache then pages the whole KV
+/// through faults spread across every step. Slicing (``.ellipsis``) plus
+/// ``MLXArray/eval()`` forces that copy once, at load time.
+private func materializeSnapshotCaches(_ caches: inout [KVCache]) {
+    func materialized(_ array: MLXArray) -> MLXArray {
+        let copy = array[.ellipsis]
+        copy.eval()
+        return copy
+    }
+    for i in caches.indices {
+        let arrays = caches[i].state.map(materialized)
+        guard !arrays.isEmpty else { continue }
+        caches[i].state = arrays
+    }
+    // LMOutput.State carries only small recurrent-state scalars today; the KV
+    // bulk (GB-scale attention rows) lives in the per-layer caches above.
 }
 
 private func promptCacheStateArrays(
