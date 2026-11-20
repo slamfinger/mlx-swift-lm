@@ -2350,8 +2350,12 @@ public final class ChatSession {
         }
     }
 
-    /// Return model-wide cache progress for test support.
-    func cacheProgress() async -> (main: Int, draft: Int?)? {
+    /// Return the processed-token counts of the currently realized session cache.
+    ///
+    /// This is a lightweight progress read for runtime control paths. Unlike
+    /// `cacheStatus()`, it does not construct per-layer diagnostics or inspect
+    /// cache tensor storage. Returns `nil` until the session owns a realized KV cache.
+    public func cacheProgress() async -> (main: Int, draft: Int?)? {
         await cache.read { cache in
             guard case .kvcache(let stored) = cache else { return nil }
             return (

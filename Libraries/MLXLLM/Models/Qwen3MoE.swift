@@ -150,8 +150,17 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
             scores = selected
         }
 
-        let y = switchMLP(x, inds)
-        return weightedExpertSum(y, scores)
+        // Flatten the batch/sequence dimensions before entering SwitchGLU.
+        // Its fused reduction is limited to quantized BF16 top-8 prefill rows;
+        // unsupported shapes (including single-token decode) retain the legacy path.
+        let tokenCount = x.size / x.dim(-1)
+        let flatX = x.reshaped(tokenCount, x.dim(-1))
+        let flatIndices = inds.reshaped(tokenCount, k)
+        let flatScores = scores.reshaped(tokenCount, k)
+        let combined = switchMLP.callAndWeightedReduce(
+            flatX, flatIndices, weights: flatScores, fuseSortedReduction: true
+        )
+        return combined.reshaped(x.shape)
     }
 }
 
