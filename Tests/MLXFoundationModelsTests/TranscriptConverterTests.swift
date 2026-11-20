@@ -3,6 +3,7 @@
 import CoreGraphics
 import Foundation
 import FoundationModels
+import ImageIO
 import MLXLMCommon
 import Testing
 
@@ -17,8 +18,113 @@ private struct StructuredWeatherToolResult {
     var condition: String
 }
 
+@available(iOS 27.0, macOS 27.0, visionOS 27.0, *)
+@Generable
+private struct SchemaPromptItem {
+    @Guide(description: "The label shown to shoppers on the price tag")
+    var tagLabel: String
+}
+
 @Suite
 struct TranscriptConverterTests {
+
+    @Test
+    func testInliningSchemaWithoutSchemaLeavesMessagesUnchanged() {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let input: [Chat.Message] = [.system("Be brief."), .user("Hi")]
+        let output = TranscriptConverter.messages(input, inliningSchemaJSON: nil)
+
+        #expect(output.map(\.role) == input.map(\.role))
+        #expect(output.map(\.content) == input.map(\.content))
+    }
+
+    @Test
+    func testInliningSchemaAppendsToLeadingSystemMessage() {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let input: [Chat.Message] = [.system("Be brief."), .user("Hi")]
+        let output = TranscriptConverter.messages(
+            input, inliningSchemaJSON: "{\"type\":\"object\"}")
+
+        #expect(output.count == 2)
+        #expect(output.filter { $0.role == .system }.count == 1)
+        #expect(output[0].content.hasPrefix("Be brief.\n\n"))
+        #expect(output[0].content.contains("{\"type\":\"object\"}"))
+        #expect(output[1].role == .user)
+        #expect(output[1].content == "Hi")
+    }
+
+    @Test
+    func testInliningSchemaInsertsSystemMessageWhenNoneExists() {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let input: [Chat.Message] = [.user("Hi")]
+        let output = TranscriptConverter.messages(
+            input, inliningSchemaJSON: "{\"type\":\"object\"}")
+
+        #expect(output.count == 2)
+        #expect(output[0].role == .system)
+        #expect(output[0].content.contains("{\"type\":\"object\"}"))
+        #expect(output[1].role == .user)
+        #expect(output[1].content == "Hi")
+    }
+
+    @Test
+    func testInlinedSchemaCarriesGuideDescriptions() throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let json = try SchemaConverter.encodeToJSON(SchemaPromptItem.generationSchema)
+        let output = TranscriptConverter.messages([.user("Hi")], inliningSchemaJSON: json)
+
+        #expect(output[0].role == .system)
+        #expect(output[0].content.contains("The label shown to shoppers on the price tag"))
+    }
+
+    @Test(arguments: [(nil as Bool?, true), (true as Bool?, true), (false as Bool?, false)])
+    func testSchemaJSONForPromptHonorsIncludeFlag(flag: Bool?, included: Bool) {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let result = TranscriptConverter.schemaJSONForPrompt("{}", includeSchemaInPrompt: flag)
+        #expect((result != nil) == included)
+        #expect(TranscriptConverter.schemaJSONForPrompt(nil, includeSchemaInPrompt: flag) == nil)
+    }
+
+    @Test
+    func testPromptMessagesAddSchemaOnlyForGuidedGeneration() {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let collected: [Chat.Message] = [.system("Be brief."), .user("Hi")]
+        let prompts = TranscriptConverter.promptMessages(
+            collected, schemaJSON: "{\"type\":\"object\"}", includeSchemaInPrompt: nil)
+
+        #expect(prompts.withoutSchema.map(\.content) == collected.map(\.content))
+        #expect(prompts.withSchema[0].content.contains("{\"type\":\"object\"}"))
+    }
+
+    @Test
+    func testPromptMessagesWithSchemaOptOutMatchCollected() {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let collected: [Chat.Message] = [.user("Hi")]
+        let prompts = TranscriptConverter.promptMessages(
+            collected, schemaJSON: "{}", includeSchemaInPrompt: false)
+
+        #expect(prompts.withSchema.map(\.content) == collected.map(\.content))
+        #expect(prompts.withoutSchema.map(\.content) == collected.map(\.content))
+    }
+
+    @Test
+    func testPromptMessagesWithoutSchemaMatchCollected() {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let collected: [Chat.Message] = [.user("Hi")]
+        let prompts = TranscriptConverter.promptMessages(
+            collected, schemaJSON: nil, includeSchemaInPrompt: nil)
+
+        #expect(prompts.withSchema.map(\.content) == collected.map(\.content))
+        #expect(prompts.withoutSchema.map(\.content) == collected.map(\.content))
+    }
 
     @Test
     func testConvertInstructionsToSystemMessage() throws {
@@ -32,7 +138,7 @@ struct TranscriptConverterTests {
         )
 
         let entries: [Transcript.Entry] = [.instructions(instructions)]
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
 
         #expect(messages.count == 1)
         let message = messages.first!
@@ -52,7 +158,7 @@ struct TranscriptConverterTests {
         )
 
         let entries: [Transcript.Entry] = [.prompt(prompt)]
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
 
         #expect(messages.count == 1)
         let message = messages.first!
@@ -72,7 +178,7 @@ struct TranscriptConverterTests {
         )
 
         let entries: [Transcript.Entry] = [.response(response)]
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
 
         #expect(messages.count == 1)
         let message = messages.first!
@@ -93,7 +199,7 @@ struct TranscriptConverterTests {
         )
 
         let entries: [Transcript.Entry] = [.prompt(prompt)]
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
 
         #expect(messages.count == 1)
         let message = messages.first!
@@ -128,7 +234,7 @@ struct TranscriptConverterTests {
                 )),
         ]
 
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
 
         #expect(messages.count == 4)
         #expect(messages[0].role == .system)
@@ -142,7 +248,7 @@ struct TranscriptConverterTests {
         guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
 
         let entries: [Transcript.Entry] = []
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
 
         #expect(messages.isEmpty)
     }
@@ -162,7 +268,7 @@ struct TranscriptConverterTests {
                 ))
         ]
 
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
         #expect(messages.count == 1)
     }
 
@@ -178,7 +284,7 @@ struct TranscriptConverterTests {
             .toolCalls(Transcript.ToolCalls(id: "tc_1", [toolCall]))
         ]
 
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
 
         #expect(messages.count == 1)
         #expect(messages[0].role == .assistant)
@@ -205,7 +311,7 @@ struct TranscriptConverterTests {
             segments: [.text(Transcript.TextSegment(content: "18C and sunny"))])
         let entries: [Transcript.Entry] = [.toolOutput(output)]
 
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
 
         #expect(messages.count == 1)
         #expect(messages[0].role == .tool)
@@ -244,7 +350,7 @@ struct TranscriptConverterTests {
                             content: testCase.content))
                 ])
 
-            let messages = TranscriptConverter.mlxMessages(for: [.toolOutput(output)])
+            let messages = try TranscriptConverter.mlxMessages(for: [.toolOutput(output)])
 
             #expect(messages.count == 1)
             let message = try #require(messages.first)
@@ -274,7 +380,7 @@ struct TranscriptConverterTests {
                 .text(Transcript.TextSegment(content: "Use this current reading.")),
             ])
 
-        let messages = TranscriptConverter.mlxMessages(for: [.toolOutput(output)])
+        let messages = try TranscriptConverter.mlxMessages(for: [.toolOutput(output)])
 
         let message = try #require(messages.first)
         #expect(
@@ -310,7 +416,7 @@ struct TranscriptConverterTests {
             .toolOutput(output),
         ]
 
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
 
         #expect(messages.map(\.role) == [.user, .assistant, .tool])
 
@@ -353,7 +459,7 @@ struct TranscriptConverterTests {
             .toolOutput(outputB),
         ]
 
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
 
         // Both rounds replay in order: each assistant tool-call message is
         // immediately followed by its correlated tool result, so a third-round
@@ -397,7 +503,7 @@ struct TranscriptConverterTests {
                 )),
         ]
 
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
 
         #expect(messages.count == 2)
         #expect(messages[0].role == .user)
@@ -426,7 +532,7 @@ struct TranscriptConverterTests {
                 )),
         ]
 
-        let messages = TranscriptConverter.mlxMessages(for: entries)
+        let messages = try TranscriptConverter.mlxMessages(for: entries)
 
         #expect(messages.count == 1)
         #expect(messages[0].role == .user)
@@ -448,12 +554,13 @@ struct TranscriptConverterTests {
             responseFormat: nil
         )
 
-        let messages = TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
+        let messages = try TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
 
         #expect(messages.count == 1)
         #expect(messages[0].role == .user)
         #expect(messages[0].content == "Describe this")
         #expect(messages[0].images.count == 1)
+        #expect(messages[0].images.first?.label == "photo")
     }
 
     @Test
@@ -468,16 +575,17 @@ struct TranscriptConverterTests {
             responseFormat: nil
         )
 
-        let messages = TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
+        let messages = try TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
 
         #expect(messages.count == 1)
         #expect(messages[0].role == .user)
         #expect(messages[0].content == "")
         #expect(messages[0].images.count == 1)
+        #expect(messages[0].images.first?.label == "photo")
     }
 
     @Test
-    func testInstructionsImageAttachmentBecomesSystemMessageImage() throws {
+    func testInstructionsImageAttachmentIsDropped() throws {
         guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
 
         let attachment = Transcript.AttachmentSegment(
@@ -491,12 +599,27 @@ struct TranscriptConverterTests {
             toolDefinitions: []
         )
 
-        let messages = TranscriptConverter.mlxMessages(for: [.instructions(instructions)])
+        let messages = try TranscriptConverter.mlxMessages(for: [.instructions(instructions)])
 
         #expect(messages.count == 1)
         #expect(messages[0].role == .system)
         #expect(messages[0].content == "Use this reference:")
-        #expect(messages[0].images.count == 1)
+        #expect(messages[0].images.isEmpty)
+    }
+
+    @Test
+    func testInstructionsWithOnlyAnImageProducesNoMessage() throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let attachment = Transcript.AttachmentSegment(
+            content: .image(Transcript.ImageAttachment(makeSolidCGImage())),
+            label: "reference")
+        let instructions = Transcript.Instructions(
+            segments: [.attachment(attachment)], toolDefinitions: [])
+
+        let messages = try TranscriptConverter.mlxMessages(for: [.instructions(instructions)])
+
+        #expect(messages.isEmpty)
     }
 
     @Test
@@ -514,7 +637,7 @@ struct TranscriptConverterTests {
             responseFormat: nil
         )
 
-        let messages = TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
+        let messages = try TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
 
         #expect(messages.count == 1)
         #expect(messages[0].images.count == 1)
@@ -525,7 +648,7 @@ struct TranscriptConverterTests {
             Issue.record("Expected one image input")
             return
         }
-        guard case .ciImage = image else {
+        guard case .ciImage = image.source else {
             Issue.record("URL-backed attachment should yield .ciImage, not .url")
             return
         }
@@ -551,13 +674,13 @@ struct TranscriptConverterTests {
             responseFormat: nil
         )
 
-        let messages = TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
+        let messages = try TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
 
         #expect(messages.count == 1)
         #expect(messages[0].images.count == 2)
         // Segment order is preserved: the 2x2 image precedes the 4x4 image.
         let widths = messages[0].images.compactMap { image -> CGFloat? in
-            guard case .ciImage(let ciImage) = image else { return nil }
+            guard case .ciImage(let ciImage) = image.source else { return nil }
             return ciImage.extent.width
         }
         #expect(widths == [2, 4])
@@ -580,11 +703,133 @@ struct TranscriptConverterTests {
             responseFormat: nil
         )
 
-        let messages = TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
+        let messages = try TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
 
         #expect(messages.count == 1)
-        #expect(messages[0].content == "line one\nline two")
+        #expect(
+            messages[0].content == """
+                line one
+                line two
+                """)
         #expect(messages[0].images.count == 1)
+        #expect(messages[0].images.first?.label == "photo")
+    }
+
+    @Test
+    func testLabelsRideOnTheImagesTheyName() throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let first = Transcript.AttachmentSegment(
+            content: .image(Transcript.ImageAttachment(makeSolidCGImage())),
+            label: "Photo_A1B2C3")
+        let second = Transcript.AttachmentSegment(
+            content: .image(Transcript.ImageAttachment(makeSolidCGImage())),
+            label: "Photo_D4E5F6")
+        let prompt = Transcript.Prompt(
+            segments: [
+                .text(Transcript.TextSegment(content: "Compare these two images:")),
+                .attachment(first),
+                .attachment(second),
+            ],
+            responseFormat: nil
+        )
+
+        let messages = try TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
+
+        #expect(messages.count == 1)
+        #expect(messages[0].content == "Compare these two images:")
+        #expect(messages[0].images.map(\.label) == ["Photo_A1B2C3", "Photo_D4E5F6"])
+    }
+
+    @Test
+    func testUnlabeledAttachmentLeavesTheImageUnnamed() throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let attachment = Transcript.AttachmentSegment(
+            content: .image(Transcript.ImageAttachment(makeSolidCGImage())),
+            label: nil)
+        let prompt = Transcript.Prompt(
+            segments: [
+                .text(Transcript.TextSegment(content: "Describe this")),
+                .attachment(attachment),
+            ],
+            responseFormat: nil
+        )
+
+        let messages = try TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
+
+        #expect(messages[0].content == "Describe this")
+        #expect(messages[0].images.count == 1)
+        #expect(messages[0].images.first?.label == nil)
+    }
+
+    @Test
+    func testOrientationIsAppliedToTheImageHandedToTheModel() throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let wide = makeSolidCGImage(width: 8, height: 2)
+        let attachment = Transcript.AttachmentSegment(
+            content: .image(Transcript.ImageAttachment(wide, orientation: .right)),
+            label: "rotated")
+        let prompt = Transcript.Prompt(
+            segments: [.attachment(attachment)], responseFormat: nil)
+
+        let messages = try TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
+
+        guard case .ciImage(let image) = messages[0].images.first?.source else {
+            Issue.record("Expected one CIImage input")
+            return
+        }
+        #expect(image.extent.width == 2)
+        #expect(image.extent.height == 8)
+    }
+
+    @Test
+    func testNaturalOrientationLeavesTheImageUnchanged() throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        let wide = makeSolidCGImage(width: 8, height: 2)
+        let attachment = Transcript.AttachmentSegment(
+            content: .image(Transcript.ImageAttachment(wide, orientation: nil)),
+            label: "natural")
+        let prompt = Transcript.Prompt(
+            segments: [.attachment(attachment)], responseFormat: nil)
+
+        let messages = try TranscriptConverter.mlxMessages(for: [.prompt(prompt)])
+
+        guard case .ciImage(let image) = messages[0].images.first?.source else {
+            Issue.record("Expected one CIImage input")
+            return
+        }
+        #expect(image.extent.width == 8)
+        #expect(image.extent.height == 2)
+    }
+
+    @Test
+    func testAttachmentLabelsAreCollectedInFirstSeenOrderWithoutDuplicates() throws {
+        guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
+
+        func promptEntry(_ labels: [String?]) -> Transcript.Entry {
+            .prompt(
+                Transcript.Prompt(
+                    segments: labels.map { label in
+                        .attachment(
+                            Transcript.AttachmentSegment(
+                                content: .image(
+                                    Transcript.ImageAttachment(makeSolidCGImage())),
+                                label: label))
+                    },
+                    responseFormat: nil))
+        }
+
+        let entries = [
+            promptEntry(["Photo_A1B2C3", nil]),
+            promptEntry(["Photo_D4E5F6", "Photo_A1B2C3"]),
+        ]
+
+        #expect(
+            TranscriptConverter.labeledAttachments(in: entries).map(\.label)
+                == ["Photo_A1B2C3", "Photo_D4E5F6"])
     }
 
 }

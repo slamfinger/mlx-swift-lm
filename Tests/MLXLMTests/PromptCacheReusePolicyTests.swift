@@ -20,7 +20,7 @@ struct PromptCacheReusePolicyTests {
         attentionMask: Bool = false,
         modelState: Bool = false,
         toolResultContinuation: Bool = false,
-        speculativeDecoding: Bool = false,
+        speculative: Bool = false,
         canSplitMedia: Bool = false
     ) -> PromptCacheTurn {
         PromptCacheTurn(
@@ -30,7 +30,7 @@ struct PromptCacheReusePolicyTests {
             carriesAttentionMask: attentionMask,
             carriesModelState: modelState,
             isToolResultContinuation: toolResultContinuation,
-            usesSpeculativeDecoding: speculativeDecoding,
+            usesSpeculativeDecoding: speculative,
             canSplitPreparedMedia: canSplitMedia)
     }
 
@@ -39,7 +39,7 @@ struct PromptCacheReusePolicyTests {
     private func alignedCache(
         _ cached: [Int],
         processed: Int? = nil,
-        draftAligned: Bool = true,
+        speculativeReuseCapability: SpeculativeCacheReuseCapability = .unavailable,
         trimmable: Bool = true
     ) -> PromptCacheState {
         let processedTokenCount = processed ?? cached.count
@@ -47,8 +47,8 @@ struct PromptCacheReusePolicyTests {
             cachedTokens: cached,
             processedTokenCount: processedTokenCount,
             mainCacheIsAligned: processedTokenCount == cached.count,
-            draftCacheIsAligned: draftAligned,
-            isTrimmable: trimmable)
+            speculativeReuseCapability: speculativeReuseCapability,
+            maxTrimCount: trimmable ? cached.count : 0)
     }
 
     // MARK: - Fresh and empty caches
@@ -68,7 +68,7 @@ struct PromptCacheReusePolicyTests {
             cachedTokens: [],
             processedTokenCount: 12,
             mainCacheIsAligned: false,
-            isTrimmable: true)
+            maxTrimCount: 12)
 
         #expect(
             PromptCacheReusePolicy().decide(turn: turn(prompt: [1, 2, 3]), cache: cache) == .rebuild
@@ -95,10 +95,19 @@ struct PromptCacheReusePolicyTests {
 
     @Test func `a misaligned draft cache blocks suffix reuse`() {
         let decision = PromptCacheReusePolicy().decide(
-            turn: turn(prompt: [1, 2, 3, 4]),
-            cache: alignedCache([1, 2, 3], draftAligned: false))
+            turn: turn(prompt: [1, 2, 3, 4], speculative: true),
+            cache: alignedCache([1, 2, 3], speculativeReuseCapability: .unavailable))
 
         #expect(decision == .rebuild)
+    }
+
+    @Test func `a missing ordinary draft remains tentatively rebuildable`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 3, 4], speculative: true),
+            cache: alignedCache(
+                [1, 2, 3], speculativeReuseCapability: .rebuildableFromPrompt))
+
+        #expect(decision == .appendSuffix(suffixStart: 3, representedTokens: [1, 2, 3, 4]))
     }
 
     @Test func `new media invalidates the cached text prefix`() {
@@ -146,7 +155,7 @@ struct PromptCacheReusePolicyTests {
         #expect(
             PromptCacheReusePolicy().decide(
                 turn: turn(
-                    prompt: [1, 2, 3, 4], newMedia: true, speculativeDecoding: true,
+                    prompt: [1, 2, 3, 4], newMedia: true, speculative: true,
                     canSplitMedia: true),
                 cache: alignedCache([1, 2, 3])) == .rebuild)
     }
@@ -162,8 +171,11 @@ struct PromptCacheReusePolicyTests {
     @Test func `a misaligned draft cache blocks the media split`() {
         #expect(
             PromptCacheReusePolicy().decide(
-                turn: turn(prompt: [1, 2, 3, 4], newMedia: true, canSplitMedia: true),
-                cache: alignedCache([1, 2, 3], draftAligned: false)) == .rebuild)
+                turn: turn(
+                    prompt: [1, 2, 3, 4], newMedia: true, speculative: true,
+                    canSplitMedia: true),
+                cache: alignedCache([1, 2, 3], speculativeReuseCapability: .unavailable))
+                == .rebuild)
     }
 
     @Test func `an explicit attention mask blocks suffix reuse`() {
@@ -171,6 +183,25 @@ struct PromptCacheReusePolicyTests {
             turn: turn(prompt: [1, 2, 3, 4], attentionMask: true), cache: alignedCache([1, 2, 3]))
 
         #expect(decision == .rebuild)
+    }
+
+    @Test func `aligned resumable MTP state appends only the suffix`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 3, 4], speculative: true),
+            cache: alignedCache([1, 2, 3], speculativeReuseCapability: .appendOnly))
+
+        #expect(decision == .appendSuffix(suffixStart: 3, representedTokens: [1, 2, 3, 4]))
+    }
+
+    @Test func `missing MTP continuation preserves the target prefix target-only`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 3, 4], speculative: true),
+            cache: alignedCache([1, 2, 3], speculativeReuseCapability: .mainOnlyFallback))
+
+        #expect(
+            decision
+                == .appendSuffixToMain(
+                    suffixStart: 3, representedTokens: [1, 2, 3, 4]))
     }
 
     // MARK: - Rewind to the common prefix
@@ -189,6 +220,41 @@ struct PromptCacheReusePolicyTests {
                 turn: turn(prompt: [9, 9, 9]), cache: alignedCache([1, 2, 3])) == .rebuild)
     }
 
+    @Test func `stateful MTP rewind keeps only the authoritative target cache`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 9, 9], speculative: true),
+            cache: alignedCache(
+                [1, 2, 3, 4, 5], speculativeReuseCapability: .appendOnly))
+
+        #expect(
+            decision
+                == .trimToCommonPrefixMainOnly(
+                    commonPrefixLength: 2, trimCount: 3))
+    }
+
+    @Test func `stateless MTP can follow a target rewind`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 9, 9], speculative: true),
+            cache: alignedCache([1, 2, 3, 4, 5], speculativeReuseCapability: .reusable))
+
+        #expect(decision == .trimToCommonPrefix(commonPrefixLength: 2, trimCount: 3))
+    }
+
+    @Test(arguments: [
+        SpeculativeCacheReuseCapability.reusable, .appendOnly,
+        .rebuildableFromPrompt, .mainOnlyFallback,
+    ])
+    func `speculative rewinds respect the exact cache rewind limit`(
+        capability: SpeculativeCacheReuseCapability
+    ) {
+        var cache = alignedCache([1, 2, 3, 4, 5], speculativeReuseCapability: capability)
+        cache.maxTrimCount = 2
+
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 9, 9], speculative: true), cache: cache) == .rebuild)
+    }
+
     @Test(arguments: [
         "prepared media", "attention mask", "model state", "not trimmable",
     ])
@@ -202,6 +268,79 @@ struct PromptCacheReusePolicyTests {
             cache: alignedCache([1, 2, 3, 4, 5], trimmable: blocker != "not trimmable"))
 
         #expect(decision == .rebuild)
+    }
+
+    // MARK: - Restore a checkpoint
+
+    /// The previous prompt was `[1, 2, 3]`, checkpointed before its last token, and its reply
+    /// `[7, 8]` is out of reach of a trim.
+    private func checkpointedCache(
+        checkpoint: Int = 2, trimmable: Bool = false,
+        speculativeReuseCapability: SpeculativeCacheReuseCapability = .unavailable
+    ) -> PromptCacheState {
+        var cache = alignedCache(
+            [1, 2, 3, 7, 8], speculativeReuseCapability: speculativeReuseCapability,
+            trimmable: trimmable)
+        cache.checkpointLength = checkpoint
+        return cache
+    }
+
+    @Test func `a reply a trim cannot reach is dropped by restoring the checkpoint`() {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(prompt: [1, 2, 3, 9, 4]), cache: checkpointedCache())
+
+        #expect(decision == .restoreCheckpoint(prefixLength: 2))
+        #expect(decision.reusesCachedPrefix)
+        #expect(decision.rewinds)
+    }
+
+    @Test func `a trim that reaches the common prefix keeps more than the checkpoint`() {
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 3, 7, 9]), cache: checkpointedCache(trimmable: true))
+                == .trimToCommonPrefix(commonPrefixLength: 4, trimCount: 1))
+    }
+
+    @Test func `a restore carries the model state a trim cannot`() {
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 3, 9, 4], modelState: true),
+                cache: checkpointedCache(trimmable: true))
+                == .restoreCheckpoint(prefixLength: 2))
+    }
+
+    @Test(arguments: ["diverged", "prepared media", "attention mask", "new media", "draft"])
+    func `a checkpoint is restored only when it is safe`(blocker: String) {
+        let decision = PromptCacheReusePolicy().decide(
+            turn: turn(
+                prompt: blocker == "diverged" ? [1, 9, 3, 9, 4] : [1, 2, 3, 9, 4],
+                newMedia: blocker == "new media",
+                preparedMedia: blocker == "prepared media",
+                attentionMask: blocker == "attention mask",
+                speculative: blocker == "draft"),
+            cache: checkpointedCache(
+                speculativeReuseCapability: blocker == "draft" ? .reusable : .unavailable))
+
+        #expect(decision == .rebuild)
+    }
+
+    @Test(arguments: [SpeculativeCacheReuseCapability.appendOnly, .mainOnlyFallback])
+    func `a checkpoint is not restored under speculative state it cannot carry`(
+        capability: SpeculativeCacheReuseCapability
+    ) {
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 3, 9, 4], speculative: true),
+                cache: checkpointedCache(speculativeReuseCapability: capability))
+                == .rebuild)
+    }
+
+    @Test func `a checkpoint is restored when the draft is rebuilt from the prompt`() {
+        #expect(
+            PromptCacheReusePolicy().decide(
+                turn: turn(prompt: [1, 2, 3, 9, 4], speculative: true),
+                cache: checkpointedCache(speculativeReuseCapability: .rebuildableFromPrompt))
+                == .restoreCheckpoint(prefixLength: 2))
     }
 
     // MARK: - Rule composition

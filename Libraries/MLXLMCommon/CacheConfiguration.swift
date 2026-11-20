@@ -114,6 +114,21 @@ public struct KVCacheStatus: Sendable, Hashable {
         case ignored
     }
 
+    /// Status of a session's prompt recovery checkpoints.
+    public struct Checkpoint: Sendable, Hashable {
+        /// Number of prompt tokens represented by the longest checkpoint.
+        /// Restoring it returns the cache to the end of this prefix.
+        public let tokens: Int
+        /// Bytes of cache tensors retained by every checkpoint.
+        /// These tensors can share storage with a restored cache or forked session.
+        public let memory: Int
+
+        package init(tokens: Int, memory: Int) {
+            self.tokens = tokens
+            self.memory = memory
+        }
+    }
+
     public let phase: Phase
     /// `nil` when no capacity or compression behavior was requested.
     public let requestedConfiguration: KVCacheConfiguration?
@@ -122,6 +137,8 @@ public struct KVCacheStatus: Sendable, Hashable {
     public let layers: [KVCacheLayerStatus]
     /// Authoritative model-wide position for realized session storage.
     public let processedTokenCount: Int?
+    /// The prompt recovery checkpoints, or `nil` when none is retained.
+    public let checkpoint: Checkpoint?
     public let capacityDisposition: CapacityDisposition
     public let capacityAppliedLayerCount: Int
     public let capacityUnappliedLayerCount: Int
@@ -155,6 +172,11 @@ public struct KVCacheStatus: Sendable, Hashable {
         layers.count { $0.state == .skipped }
     }
 
+    /// Bytes allocated across the live cache layers. Checkpoint storage is reported separately.
+    public var memoryBytes: Int {
+        layers.reduce(0) { $0 + $1.memoryBytes }
+    }
+
     /// Inspect a raw cache array using a typed request.
     public init(
         cache: [KVCache],
@@ -174,14 +196,16 @@ public struct KVCacheStatus: Sendable, Hashable {
         cache: [KVCache],
         plan: KVCachePlan,
         phase: Phase,
-        processedTokenCount: Int? = nil
+        processedTokenCount: Int? = nil,
+        checkpoint: Checkpoint? = nil
     ) {
         self.init(
             cache: cache,
             configuration: plan.configuration,
             requestSource: plan.requestSource,
             phase: phase,
-            processedTokenCount: processedTokenCount)
+            processedTokenCount: processedTokenCount,
+            checkpoint: checkpoint)
     }
 
     private init(
@@ -189,7 +213,8 @@ public struct KVCacheStatus: Sendable, Hashable {
         configuration: KVCacheConfiguration?,
         requestSource: RequestSource?,
         phase: Phase,
-        processedTokenCount: Int?
+        processedTokenCount: Int?,
+        checkpoint: Checkpoint? = nil
     ) {
         let layers = kvCacheLayerStatuses(cache: cache, configuration: configuration)
         let capacity = Self.capacityOutcome(
@@ -202,6 +227,7 @@ public struct KVCacheStatus: Sendable, Hashable {
         self.requestSource = requestSource
         self.layers = layers
         self.processedTokenCount = processedTokenCount
+        self.checkpoint = checkpoint
         self.capacityDisposition = capacity.disposition
         self.capacityAppliedLayerCount = capacity.applied
         self.capacityUnappliedLayerCount = capacity.unapplied
@@ -290,7 +316,8 @@ public func attentionCacheKind(parameters: GenerateParameters?) throws -> CacheL
 /// - Throws: ``KVCacheConfigurationError`` when the request is invalid.
 public func makeAttentionKVCache(parameters: GenerateParameters?) throws -> KVCache {
     if let capacity = try parameters?.effectiveKVCacheCapacity() {
-        return capacity.makeRotatingCache()
+        return capacity.makeRotatingCache(
+            rewindCapacity: parameters?.kvCache?.rewind?.maxTokens ?? 0)
     }
     return KVCacheSimple()
 }
@@ -313,7 +340,10 @@ public func slidingWindowCacheKind(
 public func makeSlidingWindowKVCache(parameters: GenerateParameters?, window: Int) throws
     -> KVCache
 {
-    RotatingKVCache(maxSize: try effectiveSlidingWindow(parameters: parameters, window: window))
+    let window = try effectiveSlidingWindow(parameters: parameters, window: window)
+    return RotatingKVCache(
+        maxSize: window,
+        rewindCapacity: parameters?.kvCache?.rewind?.maxTokens ?? 0)
 }
 
 /// Full-attention kind if the layer is not sliding-window; otherwise the
@@ -357,8 +387,7 @@ private func effectiveSlidingWindow(parameters: GenerateParameters?, window: Int
     // Validate the whole request, including conflicts and compression fields,
     // before a cache constructor can observe unchecked legacy values.
     _ = try parameters?.kvCachePlan()
-    if let maxKVSize = parameters?.maxKVSize {
-        return min(window, maxKVSize)
-    }
-    return window
+    let effectiveWindow = parameters?.maxKVSize.map { min(window, $0) } ?? window
+    try parameters?.kvCache?.rewind?.validate(window: effectiveWindow)
+    return effectiveWindow
 }

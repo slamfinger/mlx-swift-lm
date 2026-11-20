@@ -51,14 +51,7 @@ func gemma4DefaultTextRopeParameters() -> [String: [String: StringOrNumber]] {
     ]
 }
 
-private func gemma4DefaultVisionRopeParameters() -> [String: StringOrNumber] {
-    [
-        "rope_theta": .float(100.0),
-        "rope_type": .string("default"),
-    ]
-}
-
-private func gemma4MaskedScatter(
+func gemma4MaskedScatter(
     inputTensor: MLXArray, mask: MLXArray, source: MLXArray
 ) -> MLXArray {
     let flattenedInput = inputTensor.flattened()
@@ -81,95 +74,6 @@ private func gemma4MaskedScatter(
     let result = flattenedInput
     result[MLXArray(targetIndices, [targetIndices.count])] = flattenedSource
     return result.reshaped(inputTensor.shape)
-}
-
-private func gemma4OneHot(_ indices: MLXArray, numClasses: Int) -> MLXArray {
-    expandedDimensions(indices, axis: -1) .== MLXArray(0 ..< numClasses)
-}
-
-private func gemma4RotateHalf(_ x: MLXArray) -> MLXArray {
-    let half = x.shape[x.shape.count - 1] / 2
-    let x1 = x[.ellipsis, ..<half]
-    let x2 = x[.ellipsis, half...]
-    return concatenated([-x2, x1], axis: -1)
-}
-
-private func gemma4ApplyMultiDimensionalRoPE(
-    _ inputs: MLXArray, positions: MLXArray, baseFrequency: Float
-) -> MLXArray {
-    let headDim = inputs.shape[inputs.ndim - 1]
-    if positions.ndim == 2 {
-        let half = headDim / 2
-        let freqExponents =
-            (2.0 / Float(headDim)) * MLXArray(0 ..< half).asType(.float32)
-        let timescale = MLX.pow(MLXArray(baseFrequency), freqExponents)
-        let sinusoid = positions.asType(.float32).expandedDimensions(axis: -1) / timescale
-        var cosValue = cos(sinusoid)
-        var sinValue = sin(sinusoid)
-        cosValue = concatenated([cosValue, cosValue], axis: -1).asType(inputs.dtype)
-        sinValue = concatenated([sinValue, sinValue], axis: -1).asType(inputs.dtype)
-        cosValue = expandedDimensions(cosValue, axis: 2)
-        sinValue = expandedDimensions(sinValue, axis: 2)
-        return inputs * cosValue + gemma4RotateHalf(inputs) * sinValue
-    }
-
-    let numDimensions = positions.shape[positions.ndim - 1]
-    let channelsPerDimension = 2 * (headDim / (2 * numDimensions))
-    let halfPerDimension = channelsPerDimension / 2
-
-    var parts: [MLXArray] = []
-    parts.reserveCapacity(numDimensions)
-
-    for d in 0 ..< numDimensions {
-        let start = d * channelsPerDimension
-        let end = start + channelsPerDimension
-        let part = inputs[.ellipsis, start ..< end]
-
-        let freqExponents =
-            (2.0 / Float(channelsPerDimension)) * MLXArray(0 ..< halfPerDimension).asType(.float32)
-        let timescale = MLX.pow(MLXArray(baseFrequency), freqExponents)
-        let dimPositions = positions[.ellipsis, d ..< d + 1].asType(.float32)
-        let sinusoid = dimPositions / timescale
-
-        var cosValue = cos(sinusoid)
-        var sinValue = sin(sinusoid)
-        cosValue = concatenated([cosValue, cosValue], axis: -1).asType(inputs.dtype)
-        sinValue = concatenated([sinValue, sinValue], axis: -1).asType(inputs.dtype)
-        cosValue = expandedDimensions(cosValue, axis: 2)
-        sinValue = expandedDimensions(sinValue, axis: 2)
-
-        parts.append(part * cosValue + gemma4RotateHalf(part) * sinValue)
-    }
-
-    return concatenated(parts, axis: -1)
-}
-
-private func gemma4EnsureFusedSDPA(
-    queries: MLXArray,
-    keys: MLXArray,
-    values: MLXArray,
-    scale: Float,
-    mask: MLXFast.ScaledDotProductAttentionMaskMode
-) -> MLXArray {
-    let fusedDims = [64, 80, 128]
-    let d = queries.dim(queries.ndim - 1)
-    let target = fusedDims.first(where: { d <= $0 }) ?? d
-
-    if target == d {
-        return MLXFast.scaledDotProductAttention(
-            queries: queries, keys: keys, values: values, scale: scale, mask: mask)
-    }
-
-    let paddedQueries = MLX.padded(
-        queries, widths: [0, 0, 0, .init((0, target - d))])
-    let paddedKeys = MLX.padded(
-        keys, widths: [0, 0, 0, .init((0, target - d))])
-    let paddedValues = MLX.padded(
-        values, widths: [0, 0, 0, .init((0, target - d))])
-
-    return MLXFast.scaledDotProductAttention(
-        queries: paddedQueries, keys: paddedKeys, values: paddedValues, scale: scale, mask: mask
-    )[.ellipsis, ..<d]
 }
 
 /// Module-internal — also consumed by `Gemma4Assistant.swift`.
@@ -285,10 +189,16 @@ private func gemma4BlockSequenceIdsForMask(_ tokenTypeIds: MLXArray) -> MLXArray
     return MLX.where(isVision, groupIds, MLXArray.zeros(like: groupIds) - 1)
 }
 
-private func gemma4ApplyBlockwiseBidirectionalOverlay(
+/// Let the new tokens of each vision block attend to each other in both directions.
+///
+/// `tokenTypeIds` covers only the new tokens. Cached keys get no block, so this is
+/// right only when the cache does not end inside a vision block: an image's soft
+/// tokens must all reach the model in one call.
+func gemma4ApplyBlockwiseBidirectionalOverlay(
     _ mask: MLXFast.ScaledDotProductAttentionMaskMode,
     tokenTypeIds: MLXArray,
     sequenceLength: Int,
+    cacheOffset: Int,
     windowSize: Int?
 ) -> MLXFast.ScaledDotProductAttentionMaskMode {
     let baseMask: MLXArray
@@ -301,18 +211,31 @@ private func gemma4ApplyBlockwiseBidirectionalOverlay(
         }
         baseMask = first
     case .causal:
-        baseMask = createCausalMask(n: sequenceLength, offset: 0, windowSize: windowSize)
+        baseMask = createCausalMask(
+            n: sequenceLength, offset: cacheOffset, windowSize: windowSize)
     case .none:
-        baseMask = MLXArray.ones([sequenceLength, sequenceLength], dtype: .bool)
+        baseMask = MLXArray.ones([sequenceLength, cacheOffset + sequenceLength], dtype: .bool)
     }
 
-    guard tokenTypeIds.dim(1) == baseMask.dim(-1) else {
+    // The cache sizes the key axis; a rotating cache can present fewer rows than its offset.
+    let cachedLength = baseMask.dim(-1) - sequenceLength
+    guard tokenTypeIds.dim(1) == sequenceLength, baseMask.dim(-2) == sequenceLength,
+        cachedLength >= 0
+    else {
         return mask
     }
 
     let blockSequenceIds = gemma4BlockSequenceIdsForMask(tokenTypeIds)
+    let keyBlockIds =
+        cachedLength == 0
+        ? blockSequenceIds
+        : concatenated(
+            [
+                MLXArray.zeros([blockSequenceIds.dim(0), cachedLength], dtype: .int32) - 1,
+                blockSequenceIds,
+            ], axis: 1)
     let queryBlocks = expandedDimensions(blockSequenceIds, axis: -1)
-    let keyBlocks = expandedDimensions(blockSequenceIds, axis: -2)
+    let keyBlocks = expandedDimensions(keyBlockIds, axis: -2)
     let sameBlock = (queryBlocks .!= -1) & (queryBlocks .== keyBlocks)
     return .array(baseMask | expandedDimensions(sameBlock, axis: 1))
 }
@@ -487,69 +410,7 @@ public struct Gemma4TextConfiguration: Codable, Sendable {
     }
 }
 
-public struct Gemma4VisionConfiguration: Codable, Sendable {
-    public let modelType: String
-    public let hiddenLayers: Int
-    public let hiddenSize: Int
-    public let intermediateSize: Int
-    public let attentionHeads: Int
-    public let keyValueHeads: Int
-    public let headDim: Int
-    public let patchSize: Int
-    public let rmsNormEps: Float
-    public let defaultOutputLength: Int
-    public let positionEmbeddingSize: Int
-    public let poolingKernelSize: Int
-    public let useClippedLinears: Bool
-    public let standardize: Bool
-    public let ropeParameters: [String: StringOrNumber]
-
-    enum CodingKeys: String, CodingKey {
-        case modelType = "model_type"
-        case hiddenLayers = "num_hidden_layers"
-        case hiddenSize = "hidden_size"
-        case intermediateSize = "intermediate_size"
-        case attentionHeads = "num_attention_heads"
-        case keyValueHeads = "num_key_value_heads"
-        case headDim = "head_dim"
-        case patchSize = "patch_size"
-        case rmsNormEps = "rms_norm_eps"
-        case defaultOutputLength = "default_output_length"
-        case positionEmbeddingSize = "position_embedding_size"
-        case poolingKernelSize = "pooling_kernel_size"
-        case useClippedLinears = "use_clipped_linears"
-        case standardize
-        case ropeParameters = "rope_parameters"
-    }
-
-    public init(from decoder: any Swift.Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        modelType =
-            try c.decodeIfPresent(String.self, forKey: CodingKeys.modelType) ?? "gemma4_vision"
-        hiddenLayers = try c.decodeIfPresent(Int.self, forKey: CodingKeys.hiddenLayers) ?? 16
-        hiddenSize = try c.decodeIfPresent(Int.self, forKey: CodingKeys.hiddenSize) ?? 768
-        intermediateSize =
-            try c.decodeIfPresent(Int.self, forKey: CodingKeys.intermediateSize) ?? 3072
-        attentionHeads = try c.decodeIfPresent(Int.self, forKey: CodingKeys.attentionHeads) ?? 12
-        keyValueHeads =
-            try c.decodeIfPresent(Int.self, forKey: CodingKeys.keyValueHeads) ?? attentionHeads
-        headDim = try c.decodeIfPresent(Int.self, forKey: CodingKeys.headDim) ?? 64
-        patchSize = try c.decodeIfPresent(Int.self, forKey: CodingKeys.patchSize) ?? 16
-        rmsNormEps = try c.decodeIfPresent(Float.self, forKey: CodingKeys.rmsNormEps) ?? 1e-6
-        defaultOutputLength =
-            try c.decodeIfPresent(Int.self, forKey: CodingKeys.defaultOutputLength) ?? 280
-        positionEmbeddingSize =
-            try c.decodeIfPresent(Int.self, forKey: CodingKeys.positionEmbeddingSize) ?? 10_240
-        poolingKernelSize =
-            try c.decodeIfPresent(Int.self, forKey: CodingKeys.poolingKernelSize) ?? 3
-        useClippedLinears =
-            try c.decodeIfPresent(Bool.self, forKey: CodingKeys.useClippedLinears) ?? false
-        standardize = try c.decodeIfPresent(Bool.self, forKey: CodingKeys.standardize) ?? false
-        ropeParameters =
-            try c.decodeIfPresent([String: StringOrNumber].self, forKey: CodingKeys.ropeParameters)
-            ?? gemma4DefaultVisionRopeParameters()
-    }
-}
+/// Configuration of the Gemma 4 audio encoder (`model_type: gemma4_audio`).
 
 public struct Gemma4Configuration: Codable, Sendable {
     public let textConfiguration: Gemma4TextConfiguration
@@ -622,34 +483,10 @@ public struct Gemma4Configuration: Codable, Sendable {
 // MARK: - Text
 
 /// Module-internal — also consumed by `Gemma4Assistant.swift`.
-final class Gemma4RMSNormNoScale: Module, UnaryLayer {
-    let eps: Float
-
-    init(eps: Float = 1e-6) {
-        self.eps = eps
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        MLXFast.rmsNorm(x, weight: MLXArray.mlxNone, eps: eps)
-    }
-}
+typealias Gemma4RMSNormNoScale = MLXLMCommon.Gemma4RMSNormNoScale
 
 /// Module-internal — also consumed by `Gemma4Assistant.swift`.
-final class Gemma4RMSNormZeroShift: Module, UnaryLayer {
-    let eps: Float
-    @ModuleInfo var weight: MLXArray
-
-    init(dimensions: Int, eps: Float = 1e-6) {
-        self.eps = eps
-        self._weight.wrappedValue = MLXArray.ones([dimensions])
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        MLXFast.rmsNorm(x, weight: weight, eps: eps)
-    }
-}
+typealias Gemma4RMSNormZeroShift = MLXLMCommon.Gemma4RMSNormZeroShift
 
 final class Gemma4TextMLP: Module, UnaryLayer {
     @ModuleInfo(key: "gate_proj") var gateProj: Linear
@@ -1255,14 +1092,15 @@ final class Gemma4TextBackbone: Module {
                 && !hasAudioTokens
                 && h0.dim(1) > 1
 
+            let fullCache =
+                firstFullCacheIdx < localCache.count ? localCache[firstFullCacheIdx] : nil
+            let slidingCache =
+                firstSlidingCacheIdx < localCache.count ? localCache[firstSlidingCacheIdx] : nil
             fullMask = createAttentionMask(
-                h: h0,
-                cache: firstFullCacheIdx < localCache.count ? localCache[firstFullCacheIdx] : nil,
-                returnArray: useBidirectionalVision)
+                h: h0, cache: fullCache, returnArray: useBidirectionalVision)
             slidingMask = createAttentionMask(
                 h: h0,
-                cache: firstSlidingCacheIdx < localCache.count
-                    ? localCache[firstSlidingCacheIdx] : nil,
+                cache: slidingCache,
                 windowSize: config.slidingWindow,
                 returnArray: useBidirectionalVision
             )
@@ -1271,12 +1109,14 @@ final class Gemma4TextBackbone: Module {
                     fullMask,
                     tokenTypeIds: tokenTypeIds,
                     sequenceLength: h0.dim(1),
+                    cacheOffset: fullCache?.offset ?? 0,
                     windowSize: nil
                 )
                 slidingMask = gemma4ApplyBlockwiseBidirectionalOverlay(
                     slidingMask,
                     tokenTypeIds: tokenTypeIds,
                     sequenceLength: h0.dim(1),
+                    cacheOffset: slidingCache?.offset ?? 0,
                     windowSize: config.slidingWindow
                 )
             }
@@ -1528,434 +1368,16 @@ final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
     }
 }
 
-// MARK: - Vision
-
-private final class Gemma4ClippableLinear: Module, UnaryLayer {
-    let useClipping: Bool
-
-    @ModuleInfo(key: "linear") var linear: Linear
-    @ModuleInfo(key: "input_min") var inputMin: MLXArray?
-    @ModuleInfo(key: "input_max") var inputMax: MLXArray?
-    @ModuleInfo(key: "output_min") var outputMin: MLXArray?
-    @ModuleInfo(key: "output_max") var outputMax: MLXArray?
-
-    init(inFeatures: Int, outFeatures: Int, bias: Bool = false, useClipping: Bool) {
-        self.useClipping = useClipping
-        self._linear.wrappedValue = Linear(inFeatures, outFeatures, bias: bias)
-        if useClipping {
-            self._inputMin.wrappedValue = MLXArray(-Float.infinity)
-            self._inputMax.wrappedValue = MLXArray(Float.infinity)
-            self._outputMin.wrappedValue = MLXArray(-Float.infinity)
-            self._outputMax.wrappedValue = MLXArray(Float.infinity)
-        }
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let clippedInput =
-            if let inputMin, let inputMax {
-                clip(x, min: inputMin, max: inputMax)
-            } else {
-                x
-            }
-        let projected = linear(clippedInput)
-        if let outputMin, let outputMax {
-            return clip(projected, min: outputMin, max: outputMax)
-        }
-        return projected
-    }
-}
-
-private final class Gemma4VisionRMSNorm: Module, UnaryLayer {
-    let eps: Float
-    @ModuleInfo var weight: MLXArray
-
-    init(dimensions: Int, eps: Float = 1e-6) {
-        self.eps = eps
-        self._weight.wrappedValue = MLXArray.ones([dimensions])
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let xFloat = x.asType(.float32)
-        let variance = mean(xFloat.square(), axis: -1, keepDims: true)
-        let normalized = xFloat * rsqrt(variance + eps)
-        return (normalized * weight.asType(.float32)).asType(x.dtype)
-    }
-}
-
-private final class Gemma4VisionRMSNormNoScale: Module, UnaryLayer {
-    let eps: Float
-
-    init(eps: Float = 1e-6) {
-        self.eps = eps
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        let xFloat = x.asType(.float32)
-        let variance = mean(xFloat.square(), axis: -1, keepDims: true)
-        return (xFloat * rsqrt(variance + eps)).asType(x.dtype)
-    }
-}
-
-private final class Gemma4VisionAttention: Module {
-    let numHeads: Int
-    let numKVHeads: Int
-    let headDim: Int
-    let hiddenSize: Int
-    let ropeBaseFrequency: Float
-
-    @ModuleInfo(key: "q_proj") var qProj: Gemma4ClippableLinear
-    @ModuleInfo(key: "k_proj") var kProj: Gemma4ClippableLinear
-    @ModuleInfo(key: "v_proj") var vProj: Gemma4ClippableLinear
-    @ModuleInfo(key: "o_proj") var oProj: Gemma4ClippableLinear
-    @ModuleInfo(key: "q_norm") var qNorm: Gemma4VisionRMSNorm
-    @ModuleInfo(key: "k_norm") var kNorm: Gemma4VisionRMSNorm
-    @ModuleInfo(key: "_v_norm") var vNorm: Gemma4VisionRMSNormNoScale
-
-    init(config: Gemma4VisionConfiguration) {
-        self.numHeads = config.attentionHeads
-        self.numKVHeads = config.keyValueHeads
-        self.headDim = config.headDim
-        self.hiddenSize = config.hiddenSize
-        self.ropeBaseFrequency = config.ropeParameters["rope_theta"]?.asFloat() ?? 100.0
-
-        self._qProj.wrappedValue = Gemma4ClippableLinear(
-            inFeatures: hiddenSize,
-            outFeatures: numHeads * headDim,
-            useClipping: config.useClippedLinears
-        )
-        self._kProj.wrappedValue = Gemma4ClippableLinear(
-            inFeatures: hiddenSize,
-            outFeatures: numKVHeads * headDim,
-            useClipping: config.useClippedLinears
-        )
-        self._vProj.wrappedValue = Gemma4ClippableLinear(
-            inFeatures: hiddenSize,
-            outFeatures: numKVHeads * headDim,
-            useClipping: config.useClippedLinears
-        )
-        self._oProj.wrappedValue = Gemma4ClippableLinear(
-            inFeatures: numHeads * headDim,
-            outFeatures: hiddenSize,
-            useClipping: config.useClippedLinears
-        )
-        self._qNorm.wrappedValue = Gemma4VisionRMSNorm(dimensions: headDim, eps: config.rmsNormEps)
-        self._kNorm.wrappedValue = Gemma4VisionRMSNorm(dimensions: headDim, eps: config.rmsNormEps)
-        self._vNorm.wrappedValue = Gemma4VisionRMSNormNoScale(eps: config.rmsNormEps)
-        super.init()
-    }
-
-    func callAsFunction(
-        _ x: MLXArray, positions: MLXArray, mask: MLXArray? = nil
-    ) -> MLXArray {
-        let (batch, length, _) = (x.dim(0), x.dim(1), x.dim(2))
-
-        var queries = qProj(x).reshaped(batch, length, numHeads, headDim)
-        var keys = kProj(x).reshaped(batch, length, numKVHeads, headDim)
-        var values = vProj(x).reshaped(batch, length, numKVHeads, headDim)
-
-        queries = qNorm(queries)
-        keys = kNorm(keys)
-        values = vNorm(values)
-
-        queries = gemma4ApplyMultiDimensionalRoPE(
-            queries, positions: positions, baseFrequency: ropeBaseFrequency)
-        keys = gemma4ApplyMultiDimensionalRoPE(
-            keys, positions: positions, baseFrequency: ropeBaseFrequency)
-
-        queries = queries.transposed(0, 2, 1, 3)
-        keys = keys.transposed(0, 2, 1, 3)
-        values = values.transposed(0, 2, 1, 3)
-
-        let attentionMask: MLXFast.ScaledDotProductAttentionMaskMode =
-            if let mask {
-                .array(mask)
-            } else {
-                .none
-            }
-        let output = gemma4EnsureFusedSDPA(
-            queries: queries,
-            keys: keys,
-            values: values,
-            scale: 1.0,
-            mask: attentionMask
-        )
-        .transposed(0, 2, 1, 3)
-        .reshaped(batch, length, -1)
-
-        return oProj(output)
-    }
-}
-
-private final class Gemma4VisionMLP: Module, UnaryLayer {
-    @ModuleInfo(key: "gate_proj") var gateProj: Gemma4ClippableLinear
-    @ModuleInfo(key: "up_proj") var upProj: Gemma4ClippableLinear
-    @ModuleInfo(key: "down_proj") var downProj: Gemma4ClippableLinear
-
-    init(config: Gemma4VisionConfiguration) {
-        self._gateProj.wrappedValue = Gemma4ClippableLinear(
-            inFeatures: config.hiddenSize,
-            outFeatures: config.intermediateSize,
-            useClipping: config.useClippedLinears
-        )
-        self._upProj.wrappedValue = Gemma4ClippableLinear(
-            inFeatures: config.hiddenSize,
-            outFeatures: config.intermediateSize,
-            useClipping: config.useClippedLinears
-        )
-        self._downProj.wrappedValue = Gemma4ClippableLinear(
-            inFeatures: config.intermediateSize,
-            outFeatures: config.hiddenSize,
-            useClipping: config.useClippedLinears
-        )
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        downProj(geluApproximate(gateProj(x)) * upProj(x))
-    }
-}
-
-private final class Gemma4VisionTransformerBlock: Module {
-    @ModuleInfo(key: "self_attn") var selfAttention: Gemma4VisionAttention
-    @ModuleInfo var mlp: Gemma4VisionMLP
-    @ModuleInfo(key: "input_layernorm") var inputLayerNorm: Gemma4RMSNormZeroShift
-    @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: Gemma4RMSNormZeroShift
-    @ModuleInfo(key: "pre_feedforward_layernorm") var preFeedforwardLayerNorm:
-        Gemma4RMSNormZeroShift
-    @ModuleInfo(key: "post_feedforward_layernorm") var postFeedforwardLayerNorm:
-        Gemma4RMSNormZeroShift
-
-    init(config: Gemma4VisionConfiguration) {
-        self._selfAttention.wrappedValue = Gemma4VisionAttention(config: config)
-        self._mlp.wrappedValue = Gemma4VisionMLP(config: config)
-        self._inputLayerNorm.wrappedValue = Gemma4RMSNormZeroShift(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self._postAttentionLayerNorm.wrappedValue = Gemma4RMSNormZeroShift(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self._preFeedforwardLayerNorm.wrappedValue = Gemma4RMSNormZeroShift(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        self._postFeedforwardLayerNorm.wrappedValue = Gemma4RMSNormZeroShift(
-            dimensions: config.hiddenSize, eps: config.rmsNormEps)
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray, positions: MLXArray, mask: MLXArray?) -> MLXArray {
-        let normed = inputLayerNorm(x)
-        let attentionOutput = selfAttention(normed, positions: positions, mask: mask)
-        let h = x + postAttentionLayerNorm(attentionOutput)
-        let ff = mlp(preFeedforwardLayerNorm(h))
-        return h + postFeedforwardLayerNorm(ff)
-    }
-}
-
-private final class Gemma4VisionPatchEmbedder: Module {
-    let patchSize: Int
-    let hiddenSize: Int
-    let positionEmbeddingSize: Int
-
-    @ModuleInfo(key: "input_proj") var inputProjection: Linear
-    @ModuleInfo(key: "position_embedding_table") var positionEmbeddingTable: MLXArray
-
-    init(config: Gemma4VisionConfiguration) {
-        self.patchSize = config.patchSize
-        self.hiddenSize = config.hiddenSize
-        self.positionEmbeddingSize = config.positionEmbeddingSize
-        self._inputProjection.wrappedValue = Linear(
-            3 * patchSize * patchSize, hiddenSize, bias: false)
-        self._positionEmbeddingTable.wrappedValue = MLXArray.ones([
-            2, positionEmbeddingSize, hiddenSize,
-        ])
-        super.init()
-    }
-
-    private func patchify(_ pixelValues: MLXArray) -> MLXArray {
-        let (batch, channels, height, width) = (
-            pixelValues.dim(0), pixelValues.dim(1), pixelValues.dim(2), pixelValues.dim(3)
-        )
-        let patchesH = height / patchSize
-        let patchesW = width / patchSize
-
-        var patches = pixelValues.reshaped(
-            batch, channels, patchesH, patchSize, patchesW, patchSize)
-        patches = patches.transposed(0, 2, 4, 3, 5, 1)
-        patches = patches.reshaped(batch, patchesH * patchesW, channels * patchSize * patchSize)
-        patches = 2 * (patches - 0.5)
-        return inputProjection(patches.asType(inputProjection.weight.dtype))
-    }
-
-    func callAsFunction(
-        _ pixelValues: MLXArray, patchPositions: MLXArray
-    ) -> MLXArray {
-        let hiddenStates = patchify(pixelValues)
-        let batch = patchPositions.dim(0)
-        let seqLen = patchPositions.dim(1)
-
-        let xIndices = patchPositions[0..., 0..., 0].flattened().asType(.int32)
-        let yIndices = patchPositions[0..., 0..., 1].flattened().asType(.int32)
-        let xEmbeddings = take(positionEmbeddingTable[0], xIndices, axis: 0)
-            .reshaped(batch, seqLen, hiddenSize)
-        let yEmbeddings = take(positionEmbeddingTable[1], yIndices, axis: 0)
-            .reshaped(batch, seqLen, hiddenSize)
-        return hiddenStates + xEmbeddings + yEmbeddings
-    }
-}
-
-private final class Gemma4VisionPooler: Module {
-    let hiddenSize: Int
-    let rootHiddenSize: Float
-
-    init(config: Gemma4VisionConfiguration) {
-        self.hiddenSize = config.hiddenSize
-        self.rootHiddenSize = pow(Float(config.hiddenSize), 0.5)
-        super.init()
-    }
-
-    func callAsFunction(
-        _ hiddenStates: MLXArray,
-        patchPositions: MLXArray,
-        patchesW: Int,
-        outputLength: Int
-    ) -> MLXArray {
-        let scale = MLXArray(rootHiddenSize, dtype: hiddenStates.dtype)
-        let numPatches = hiddenStates.dim(1)
-        let length = max(outputLength, 1)
-        if numPatches <= length {
-            return hiddenStates * scale
-        }
-
-        // All batch rows share one position grid, so a single [l, L] weight
-        // matrix pools every row. The processor's resize keeps both sides
-        // divisible by kernel * patchSize, so the pooled grid covers the
-        // image exactly.
-        let positions = patchPositions[0]
-        let kernel = max(Int(sqrt(Double(numPatches / length))), 1)
-        let divisor = kernel * kernel
-
-        let kernelIndices = floor(positions.asType(.float32) / Float(kernel)).asType(.int32)
-        let flatKernel =
-            kernelIndices[0..., 0] + MLXArray(Int32(max(patchesW / kernel, 1)))
-            * kernelIndices[0..., 1]
-        let weights =
-            gemma4OneHot(flatKernel, numClasses: length).asType(.float32)
-            / Float(divisor)
-        let output = einsum("lL,bld->bLd", weights, hiddenStates)
-            .asType(hiddenStates.dtype)
-        return output * scale
-    }
-}
-
-private final class Gemma4VisionTransformerModel: Module {
-    @ModuleInfo(key: "layers") var layers: [Gemma4VisionTransformerBlock]
-
-    init(config: Gemma4VisionConfiguration) {
-        self._layers.wrappedValue = (0 ..< config.hiddenLayers).map { _ in
-            Gemma4VisionTransformerBlock(config: config)
-        }
-        super.init()
-    }
-
-    func callAsFunction(_ hiddenStates: MLXArray, positions: MLXArray, mask: MLXArray?) -> MLXArray
-    {
-        var h = hiddenStates
-        for layer in layers {
-            h = layer(h, positions: positions, mask: mask)
-        }
-        return h
-    }
-}
-
-private final class Gemma4VisionModel: Module {
-    let config: Gemma4VisionConfiguration
-    let patchSize: Int
-    let poolingKernelSize: Int
-
-    @ModuleInfo(key: "patch_embedder") var patchEmbedder: Gemma4VisionPatchEmbedder
-    @ModuleInfo(key: "encoder") var encoder: Gemma4VisionTransformerModel
-    @ModuleInfo(key: "pooler") var pooler: Gemma4VisionPooler
-    @ModuleInfo(key: "std_bias") var standardizationBias: MLXArray?
-    @ModuleInfo(key: "std_scale") var standardizationScale: MLXArray?
-
-    init(config: Gemma4VisionConfiguration) {
-        self.config = config
-        self.patchSize = config.patchSize
-        self.poolingKernelSize = config.poolingKernelSize
-        self._patchEmbedder.wrappedValue = Gemma4VisionPatchEmbedder(config: config)
-        self._encoder.wrappedValue = Gemma4VisionTransformerModel(config: config)
-        self._pooler.wrappedValue = Gemma4VisionPooler(config: config)
-        if config.standardize {
-            self._standardizationBias.wrappedValue = MLXArray.zeros([config.hiddenSize])
-            self._standardizationScale.wrappedValue = MLXArray.ones([config.hiddenSize])
-        }
-        super.init()
-    }
-
-    private func patchPositions(batch: Int, patchesH: Int, patchesW: Int) -> MLXArray {
-        // .xy indexing makes x vary fastest, matching the row-major patch
-        // order the embedder and pooler expect.
-        let grids = meshGrid([
-            MLXArray.arange(patchesW, dtype: .int32),
-            MLXArray.arange(patchesH, dtype: .int32),
-        ])
-        let positions = stacked([grids[0].flattened(), grids[1].flattened()], axis: 1)
-            .reshaped(1, patchesH * patchesW, 2)
-        return batch == 1
-            ? positions
-            : broadcast(positions, to: [batch, patchesH * patchesW, 2])
-    }
-
-    /// Encodes a batch of same-sized images. Every patch is real (callers
-    /// slice padded canvases down to each image's true size first), so
-    /// attention is dense and the pooled output length falls out of the
-    /// patch grid: numPatches / poolingKernelSize².
-    func callAsFunction(_ pixelValues: MLXArray) -> MLXArray {
-        let pixels =
-            if pixelValues.ndim == 3 {
-                expandedDimensions(pixelValues, axis: 0)
-            } else {
-                pixelValues
-            }
-        let batch = pixels.dim(0)
-        let patchesH = pixels.dim(2) / patchSize
-        let patchesW = pixels.dim(3) / patchSize
-        let numPatches = patchesH * patchesW
-        let outputLength = max(numPatches / (poolingKernelSize * poolingKernelSize), 1)
-
-        let patchPositions = patchPositions(batch: batch, patchesH: patchesH, patchesW: patchesW)
-        var hiddenStates = patchEmbedder(pixels, patchPositions: patchPositions)
-        hiddenStates = encoder(hiddenStates, positions: patchPositions, mask: nil)
-        hiddenStates = pooler(
-            hiddenStates, patchPositions: patchPositions, patchesW: patchesW,
-            outputLength: outputLength)
-
-        if let standardizationBias, let standardizationScale {
-            hiddenStates = (hiddenStates - standardizationBias) * standardizationScale
-        }
-        return hiddenStates
-    }
-}
-
-private final class Gemma4MultimodalEmbedder: Module, UnaryLayer {
-    @ModuleInfo(key: "embedding_projection") var embeddingProjection: Linear
-    @ModuleInfo(key: "embedding_pre_projection_norm") var embeddingPreProjectionNorm:
-        Gemma4RMSNormNoScale
-
-    init(embeddingDim: Int, textHiddenSize: Int, eps: Float) {
-        self._embeddingProjection.wrappedValue = Linear(embeddingDim, textHiddenSize, bias: false)
-        self._embeddingPreProjectionNorm.wrappedValue = Gemma4RMSNormNoScale(eps: eps)
-        super.init()
-    }
-
-    func callAsFunction(_ x: MLXArray) -> MLXArray {
-        embeddingProjection(embeddingPreProjectionNorm(x))
-    }
-}
+// Shared encoders keep the existing MLXVLM names available.
+public typealias Gemma4VisionConfiguration = MLXLMCommon.Gemma4VisionConfiguration
+package typealias Gemma4AudioConfiguration = MLXLMCommon.Gemma4AudioConfiguration
+package typealias Gemma4VisionModel = MLXLMCommon.Gemma4VisionModel
+package typealias Gemma4AudioModel = MLXLMCommon.Gemma4AudioModel
+package typealias Gemma4MultimodalEmbedder = MLXLMCommon.Gemma4MultimodalEmbedder
 
 // MARK: - Model
 
-public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
+public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider, SuppressedTokensProviding {
     @ModuleInfo(key: "vision_tower") private var visionTower: Gemma4VisionModel
     /// Module-internal — also reached by `Gemma4Assistant.swift` (drafter `bind()`
     /// walks here to cache the target's input embeddings, embed scale, and
@@ -1969,8 +1391,32 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     public var kvHeads: [Int] { languageModel.kvHeads }
     public var loraLayers: [Module] { languageModel.model.layers }
 
+    /// Final-norm hidden states of the text decoder for `input`, `(B, L, hiddenSize)`: the
+    /// tensor the LM head consumes, built as `prepare` builds it, without the head or a cache.
+    @_spi(GemmaEncoder) public func hiddenStates(_ input: LMInput) throws -> MLXArray {
+        guard input.image != nil || input.video != nil else {
+            return languageModel.model(input.text.tokens).hidden
+        }
+        let (inputsEmbeds, perLayerInputs, tokenTypeIds) = try multimodalInputs(input)
+        return languageModel.model(
+            nil, inputsEmbeds: inputsEmbeds, perLayerInputs: perLayerInputs,
+            tokenTypeIds: tokenTypeIds
+        ).hidden
+    }
+
+    /// Multimodal placeholder token IDs that must never be sampled as text.
+    /// Seeded from the model configuration; the model factory merges
+    /// `suppress_tokens` from `generation_config.json` on top.
+    /// See `SuppressedTokensProviding` in MLXLMCommon.
+    public var suppressedTokenIds: Set<Int>
+
     public init(_ config: Gemma4Configuration) {
         self.config = config
+        self.suppressedTokenIds = Set(
+            [
+                config.imageTokenId, config.audioTokenId,
+                config.boiTokenId, config.eoiTokenId,
+            ].compactMap { $0 })
         self._visionTower.wrappedValue = Gemma4VisionModel(config: config.visionConfiguration)
         self._languageModel.wrappedValue = Gemma4TextLanguageModel(config.textConfiguration)
         self._embedVision.wrappedValue = Gemma4MultimodalEmbedder(
@@ -1983,6 +1429,19 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
 
     public func newCache(parameters: GenerateParameters?) throws -> [any KVCache] {
         try languageModel.newCache(parameters: parameters)
+    }
+
+    /// Embeddings, per-layer inputs and token types for a multimodal `input`, shared by
+    /// `prepare` and `hiddenStates(_:)`.
+    private func multimodalInputs(_ input: LMInput) throws -> (MLXArray, MLXArray?, MLXArray) {
+        let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
+            inputIds: input.text.tokens, image: input.image, video: input.video)
+        let tokenTypeIds = gemma4TokenTypeIds(
+            inputIds: input.text.tokens,
+            imageTokenId: config.imageTokenId,
+            videoTokenId: config.videoTokenId,
+            audioTokenId: config.audioTokenId)
+        return (inputsEmbeds, perLayerInputs, tokenTypeIds)
     }
 
     private func getInputEmbeddings(
@@ -2103,6 +1562,8 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
             inputTensor: inputsEmbeds, mask: maskExpanded, source: features)
     }
 
+    /// A warm `cache` must not end inside an image's soft tokens: the cached tokens
+    /// of that image could not attend to the rest of it.
     public func prepare(
         _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
     ) throws
@@ -2110,18 +1571,13 @@ public final class Gemma4: Module, VLMModel, KVCacheDimensionProvider {
     {
         let convertedCache = cache.map { $0 }
         if input.image != nil || input.video != nil {
-            let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
-                inputIds: input.text.tokens, image: input.image, video: input.video)
+            let (inputsEmbeds, perLayerInputs, tokenTypeIds) = try multimodalInputs(input)
             let result = languageModel(
                 nil,
                 cache: convertedCache,
                 inputsEmbeds: inputsEmbeds,
                 perLayerInputs: perLayerInputs,
-                tokenTypeIds: gemma4TokenTypeIds(
-                    inputIds: input.text.tokens,
-                    imageTokenId: config.imageTokenId,
-                    videoTokenId: config.videoTokenId,
-                    audioTokenId: config.audioTokenId)
+                tokenTypeIds: tokenTypeIds
             )
             let total = inputsEmbeds.dim(1)
             prefill.progress?(total, total)
@@ -2398,7 +1854,9 @@ private final class Gemma4UnifiedVisionEmbedder: Module {
     }
 }
 
-public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
+public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider,
+    SuppressedTokensProviding
+{
     @ModuleInfo(key: "language_model") private var languageModel: Gemma4TextLanguageModel
     @ModuleInfo(key: "vision_embedder") private var visionEmbedder: Gemma4UnifiedVisionEmbedder?
     @ModuleInfo(key: "embed_vision") private var embedVision: Gemma4MultimodalEmbedder?
@@ -2410,8 +1868,32 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
     public var kvHeads: [Int] { languageModel.kvHeads }
     public var loraLayers: [Module] { languageModel.model.layers }
 
+    /// Final-norm hidden states of the text decoder for `input`, `(B, L, hiddenSize)`: the
+    /// tensor the LM head consumes, built as `prepare` builds it, without the head or a cache.
+    @_spi(GemmaEncoder) public func hiddenStates(_ input: LMInput) throws -> MLXArray {
+        guard input.image != nil || input.video != nil || input.audio != nil else {
+            return languageModel.model(input.text.tokens).hidden
+        }
+        let (inputsEmbeds, perLayerInputs, tokenTypeIds) = try multimodalInputs(input)
+        return languageModel.model(
+            nil, inputsEmbeds: inputsEmbeds, perLayerInputs: perLayerInputs,
+            tokenTypeIds: tokenTypeIds
+        ).hidden
+    }
+
+    /// Multimodal placeholder token IDs that must never be sampled as text.
+    /// Seeded from the model configuration; the model factory merges
+    /// `suppress_tokens` from `generation_config.json` on top.
+    /// See `SuppressedTokensProviding` in MLXLMCommon.
+    public var suppressedTokenIds: Set<Int>
+
     public init(_ config: Gemma4UnifiedConfiguration) {
         self.config = config
+        self.suppressedTokenIds = Set(
+            [
+                config.imageTokenId, config.audioTokenId, config.videoTokenId,
+                config.boiTokenId, config.eoiTokenId, config.boaTokenId, config.eoaTokenId,
+            ].compactMap { $0 })
         self._languageModel.wrappedValue = Gemma4TextLanguageModel(config.textConfiguration)
         if let visionConfiguration = config.visionConfiguration {
             self._visionEmbedder.wrappedValue = Gemma4UnifiedVisionEmbedder(
@@ -2493,6 +1975,27 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
         )
     }
 
+    /// Embeddings, per-layer inputs and token types for a multimodal `input`, shared by
+    /// `prepare` and `hiddenStates(_:)`.
+    private func multimodalInputs(_ input: LMInput) throws -> (MLXArray, MLXArray?, MLXArray) {
+        let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
+            inputIds: input.text.tokens,
+            pixelValues: input.image?.pixels,
+            imagePositionIds: input.image?.positionIds,
+            videoPixelValues: input.video?.pixels,
+            videoPositionIds: input.video?.positionIds,
+            audioFeatures: input.audio?.features,
+            audioMask: input.audio?.mask
+        )
+        let tokenTypeIds = gemma4TokenTypeIds(
+            inputIds: input.text.tokens,
+            imageTokenId: config.imageTokenId,
+            videoTokenId: config.videoTokenId,
+            audioTokenId: config.audioTokenId
+        )
+        return (inputsEmbeds, perLayerInputs, tokenTypeIds)
+    }
+
     private func getInputEmbeddings(
         inputIds: MLXArray,
         pixelValues: MLXArray? = nil,
@@ -2568,6 +2071,8 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
         return (inputsEmbeds, perLayerInputs)
     }
 
+    /// A warm `cache` must not end inside an image's soft tokens: the cached tokens
+    /// of that image could not attend to the rest of it.
     public func prepare(
         _ input: LMInput, cache: [any KVCache], state _: LMOutput.State?, prefill: PrefillParameters
     ) throws
@@ -2578,21 +2083,7 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
                 input, cache: cache, prefill: prefill, languageModel: languageModel)
         }
 
-        let (inputsEmbeds, perLayerInputs) = try getInputEmbeddings(
-            inputIds: input.text.tokens,
-            pixelValues: input.image?.pixels,
-            imagePositionIds: input.image?.positionIds,
-            videoPixelValues: input.video?.pixels,
-            videoPositionIds: input.video?.positionIds,
-            audioFeatures: input.audio?.features,
-            audioMask: input.audio?.mask
-        )
-        let tokenTypeIds = gemma4TokenTypeIds(
-            inputIds: input.text.tokens,
-            imageTokenId: config.imageTokenId,
-            videoTokenId: config.videoTokenId,
-            audioTokenId: config.audioTokenId
-        )
+        let (inputsEmbeds, perLayerInputs, tokenTypeIds) = try multimodalInputs(input)
         let result = languageModel(
             nil,
             cache: cache.map { $0 },
@@ -2647,6 +2138,144 @@ public final class Gemma4Unified: Module, VLMModel, KVCacheDimensionProvider {
     }
 }
 
+// MARK: - Checkpoint components
+
+extension Gemma4: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        Gemma4Checkpoint.components
+    }
+}
+
+extension Gemma4Unified: ModelComponentsProviding {
+    public var modelComponents: [ModelComponent: [CheckpointComponent]] {
+        Gemma4Checkpoint.components
+    }
+}
+
+// MARK: - Prepared input splitting
+
+/// The suffix text of an image-only Gemma 4 `input` and the images it keeps, or `nil`
+/// when the cut cannot match a cold prefill.
+///
+/// Each image owns one run of `imageTokenId` placeholders, in order. A cut inside a
+/// run is refused: the cached half of the image could not attend to the other half.
+private func gemma4SplitImagePrompt(
+    _ input: LMInput,
+    droppingFirst prefixTokenCount: Int,
+    imageCount: Int,
+    imageTokenId: Int,
+    otherMediaTokenIds: [Int?]
+) -> (text: LMInput.Text, keptImages: Range<Int>)? {
+    guard input.video == nil, input.audio == nil, imageCount > 0 else { return nil }
+
+    let tokens = input.text.tokens
+    guard tokens.ndim == 2, tokens.dim(0) == 1 else { return nil }
+    let ids = tokens.asArray(Int.self)
+    guard prefixTokenCount > 0, prefixTokenCount < ids.count else { return nil }
+
+    // The processor pairs images with an all-ones mask; anything else is real padding.
+    if let mask = input.text.mask {
+        guard mask.size == ids.count,
+            mask.asType(.int32).asArray(Int32.self).allSatisfy({ $0 == 1 })
+        else { return nil }
+    }
+    // Placeholders for media this input carries no payload for.
+    for tokenId in otherMediaTokenIds.compactMap({ $0 }) where ids.contains(tokenId) {
+        return nil
+    }
+
+    var runs: [Range<Int>] = []
+    var index = 0
+    while index < ids.count {
+        guard ids[index] == imageTokenId else {
+            index += 1
+            continue
+        }
+        let start = index
+        while index < ids.count, ids[index] == imageTokenId { index += 1 }
+        runs.append(start ..< index)
+    }
+    guard runs.count == imageCount else { return nil }
+    let cutsAnImage = runs.contains {
+        $0.lowerBound < prefixTokenCount && prefixTokenCount < $0.upperBound
+    }
+    guard !cutsAnImage else { return nil }
+
+    let dropped = runs.prefix { $0.upperBound <= prefixTokenCount }.count
+    guard dropped < runs.count else { return nil }
+
+    let suffixIds = Array(ids[prefixTokenCount...])
+    let suffixTokens = MLXArray(suffixIds).expandedDimensions(axis: 0)
+    let suffixMask = input.text.mask.map { ones([1, suffixIds.count]).asType($0.dtype) }
+    return (LMInput.Text(tokens: suffixTokens, mask: suffixMask), dropped ..< imageCount)
+}
+
+extension Gemma4: PreparedInputSplitting {
+
+    /// Keep the images whose soft tokens fall in the suffix. Each image runs through
+    /// the vision tower on its own, so dropping cached images leaves the rest unchanged.
+    ///
+    /// Returns `nil` for video, for a cut inside an image, and for a payload that does
+    /// not hold one image per placeholder run.
+    public func splitPreparedInput(_ input: LMInput, droppingFirst prefixTokenCount: Int)
+        -> LMInput?
+    {
+        guard let image = input.image, image.positionIds == nil, image.pixels.ndim == 4
+        else { return nil }
+        let imageCount = image.pixels.dim(0)
+        if let frames = image.frames, frames.count != imageCount { return nil }
+
+        guard
+            let split = gemma4SplitImagePrompt(
+                input, droppingFirst: prefixTokenCount, imageCount: imageCount,
+                imageTokenId: config.imageTokenId,
+                otherMediaTokenIds: [config.videoTokenId, config.audioTokenId])
+        else { return nil }
+
+        let kept = split.keptImages
+        return LMInput(
+            text: split.text,
+            image: LMInput.ProcessedImage(
+                pixels: image.pixels[kept.lowerBound ..< kept.upperBound],
+                frames: image.frames.map { Array($0[kept]) }))
+    }
+}
+
+extension Gemma4Unified: PreparedInputSplitting {
+
+    /// Keep the images whose soft tokens fall in the suffix, with their rows of
+    /// position ids. The vision embedder works on each patch alone, so dropping
+    /// cached images leaves the rest unchanged.
+    ///
+    /// Returns `nil` for video or audio, for a cut inside an image, and for a payload
+    /// that does not hold one image per placeholder run.
+    public func splitPreparedInput(_ input: LMInput, droppingFirst prefixTokenCount: Int)
+        -> LMInput?
+    {
+        guard let image = input.image, let positionIds = image.positionIds,
+            image.pixels.ndim == 3, positionIds.ndim == 3
+        else { return nil }
+        let imageCount = image.pixels.dim(0)
+        guard positionIds.dim(0) == imageCount else { return nil }
+        if let frames = image.frames, frames.count != imageCount { return nil }
+
+        guard
+            let split = gemma4SplitImagePrompt(
+                input, droppingFirst: prefixTokenCount, imageCount: imageCount,
+                imageTokenId: config.imageTokenId,
+                otherMediaTokenIds: [config.videoTokenId, config.audioTokenId])
+        else { return nil }
+
+        let kept = split.keptImages
+        return LMInput(
+            text: split.text,
+            image: LMInput.ProcessedImage(
+                pixels: image.pixels[kept.lowerBound ..< kept.upperBound],
+                positionIds: positionIds[kept.lowerBound ..< kept.upperBound],
+                frames: image.frames.map { Array($0[kept]) }))
+    }
+}
+
 // MARK: - MTP drafter target access
 
 /// A Gemma 4 - family VLM whose text stack is the shared
@@ -2686,17 +2315,10 @@ public struct Gemma4MessageGenerator: MessageGenerator {
         } else {
             dictionary = [
                 "role": message.role.rawValue,
-                "content": message.images.map { _ in
-                    ["type": "image"]
-                }
-                    + message.videos.map { _ in
-                        ["type": "video"]
-                    }
-                    + [
-                        ["type": "text", "text": message.content]
-                    ],
+                "content": contentParts(for: message, layout: .imagesThenVideosThenText),
             ]
         }
+        addReasoning(to: &dictionary, for: message)
         addToolMetadata(to: &dictionary, for: message)
         return dictionary
     }
@@ -2770,11 +2392,17 @@ public struct Gemma4Processor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Gemma4MessageGenerator().generate(from: input)
+        let messages = Gemma4MessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
+
+        if input.images.isEmpty, input.videos.isEmpty {
+            // No mask: one unpadded sequence needs none, and a mask stops prompt-cache reuse.
+            return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
+        }
 
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {
@@ -2998,7 +2626,21 @@ public struct Gemma4ProcessorConfiguration: Codable, Sendable {
     ///
     /// Note the config's `size` entry is deliberately ignored, as in the
     /// Python reference — models ship a vestigial 224x224 there.
-    public func aspectPreservingTargetSize(for imageSize: CGSize) -> CGSize {
+    ///
+    /// - Parameters:
+    ///   - imageSize: Original image dimensions.
+    ///   - budget: Soft tokens to fit; defaults to `maxSoftTokens`.
+    public func aspectPreservingTargetSize(for imageSize: CGSize, budget: Int? = nil) -> CGSize {
+        Self.aspectPreservingTargetSize(
+            for: imageSize, maxSoftTokens: budget ?? maxSoftTokens, patchSize: patchSize,
+            poolingKernelSize: poolingKernelSize)
+    }
+
+    /// The same resize for any Gemma 4 vision geometry, shared with processors that
+    /// carry their own configuration, as Python's `get_aspect_ratio_preserving_size`.
+    static func aspectPreservingTargetSize(
+        for imageSize: CGSize, maxSoftTokens: Int, patchSize: Int, poolingKernelSize: Int
+    ) -> CGSize {
         let kernelArea = poolingKernelSize * poolingKernelSize
         let maxPatches = maxSoftTokens * kernelArea
         let sideMultiple = poolingKernelSize * patchSize
@@ -3329,11 +2971,17 @@ public struct Gemma4UnifiedProcessor: UserInputProcessor {
     }
 
     public func prepare(input: UserInput) async throws -> LMInput {
-        let messages = Gemma4MessageGenerator().generate(from: input)
+        let messages = Gemma4MessageGenerator().generate(
+            from: input.removingSpecialTokenLabels(using: tokenizer))
 
         var promptTokens = try tokenizer.applyChatTemplate(
             messages: messages, tools: input.tools,
             additionalContext: input.additionalContext)
+
+        if input.images.isEmpty {
+            // No mask: one unpadded sequence needs none, and a mask stops prompt-cache reuse.
+            return LMInput(tokens: MLXArray(promptTokens).expandedDimensions(axis: 0))
+        }
 
         var processedImage: LMInput.ProcessedImage?
         if !input.images.isEmpty {
@@ -3381,8 +3029,14 @@ public struct Gemma4UnifiedProcessor: UserInputProcessor {
 
 extension Gemma4 {
     public var toolCallFormat: ToolCallFormat? { .gemma4 }
+
+    /// Gemma 4 brackets its thinking in labeled channels rather than a delimiter
+    /// pair (see `ReasoningConfig.gemma4`).
+    public var reasoningConfig: ReasoningConfig? { .gemma4 }
 }
 
 extension Gemma4Unified {
     public var toolCallFormat: ToolCallFormat? { .gemma4 }
+
+    public var reasoningConfig: ReasoningConfig? { .gemma4 }
 }

@@ -9,11 +9,14 @@ import FoundationModels
 @testable import MLXGuidedGeneration
 
 /// Tests that `warmUp()` pre-creates the GrammarTokenizer for guided generation.
-@Suite(.serialized, .timeLimit(.minutes(5)))
-struct PrewarmGrammarTests {
+extension ModelLoadingSuite {
+    @Suite(.serialized, .timeLimit(.minutes(5))) struct PrewarmGrammarTests {}
+}
+
+extension ModelLoadingSuite.PrewarmGrammarTests {
 
     @Test
-    func prewarmCreatesXGTokenizer() async throws {
+    func prewarmCreatesGrammarTokenizer() async throws {
         guard #available(iOS 27.0, macOS 27.0, visionOS 27.0, *) else { return }
         let model = makeTestModel(TestFixtures.defaultModelID)
         let executor = try makeMLXExecutor(for: model)
@@ -26,7 +29,7 @@ struct PrewarmGrammarTests {
         // Assert the genuine cache hit, not merely that a later respond works
         // (a guided respond succeeds with or without warmup — only the seam
         // proves warmUp did the pre-creation).
-        let cached = await MLXLanguageModel.hasCachedXGTokenizer(modelID: model.modelID)
+        let cached = await MLXLanguageModel.hasCachedGrammarTokenizer(modelID: model.modelID)
         #expect(cached, "warmUp should pre-create the GrammarTokenizer")
 
         // And a guided generation still succeeds end-to-end after warmUp.

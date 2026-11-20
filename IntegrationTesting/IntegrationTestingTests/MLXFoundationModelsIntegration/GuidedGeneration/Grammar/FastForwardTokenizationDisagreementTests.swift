@@ -103,8 +103,11 @@ import MLXLMCommon
 @testable import MLXFoundationModels
 @testable import MLXGuidedGeneration
 
-@Suite(.serialized)
-struct FastForwardTokenizationDisagreementTests {
+extension ModelLoadingSuite {
+    @Suite(.serialized) struct FastForwardTokenizationDisagreementTests {}
+}
+
+extension ModelLoadingSuite.FastForwardTokenizationDisagreementTests {
 
     private enum MissingSeedError: Error {
         /// Raised when Gemma's tokenizer has no id for the seed character.
@@ -162,7 +165,7 @@ struct FastForwardTokenizationDisagreementTests {
         }
 
         try await qwenContainer.perform { qwenContext in
-            let xgTokenizer = try GrammarTokenizer(
+            let grammarTokenizer = try GrammarTokenizer(
                 vocab: seeds.vocab,
                 vocabType: seeds.vocabType,
                 eosTokenId: seeds.eosTokenId
@@ -173,7 +176,7 @@ struct FastForwardTokenizationDisagreementTests {
             // Gemma-bound matcher does not have in its current mask.
             let grammar = "root ::= \"\(Self.forcedPayload)\"\n"
             let constraint = try GrammarConstraint(
-                tokenizer: xgTokenizer,
+                tokenizer: grammarTokenizer,
                 grammar: grammar,
                 fastForward: true,
                 hostTokenizer: qwenContext.tokenizer

@@ -44,7 +44,7 @@ class Gemma2Attention: Module {
     }
 
     public func callAsFunction(
-        _ x: MLXArray, mask: MLXArray?, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
         var queries = wq(x)
@@ -73,9 +73,12 @@ class Gemma2Attention: Module {
         var scores = matmul(queries, keys.swappedAxes(-1, -2))
         scores = tanh(scores / logitSoftCap) * logitSoftCap
 
-        if let mask {
-            scores = scores + mask
+        // A per-row `[B, 1, L, S]` mask needs the head-group axis of grouped-query scores.
+        var mask = mask
+        if repeats > 1, case .array(let array) = mask, array.ndim == 4 {
+            mask = .array(expandedDimensions(array, axis: -3))
         }
+        scores = applyAttentionMask(scores: scores, mask: mask)
         scores = softmax(scores, axis: -1, precise: true)
         var output = matmul(scores, values)
         if repeats > 1 {
@@ -126,7 +129,7 @@ class Gemma2TransformerBlock: Module {
     }
 
     public func callAsFunction(
-        _ x: MLXArray, mask: MLXArray?, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
     ) -> MLXArray {
         var r = attention(inputLayerNorm(x), mask: mask, cache: cache)
         let h = x + postAttentionLayerNorm(r)
@@ -164,8 +167,8 @@ public class Gemma2ModelInner: Module {
         var h = embedTokens(inputs)
         h = h * hiddenScale
 
-        // Gemma2 uses the older array-based mask pattern with manual application in attention
-        let mask: MLXArray? = createAttentionMask(h: h, cache: cache)
+        // One materialized mask shared by every layer, as in mlx-lm gemma2.py.
+        let mask = createAttentionMask(h: h, cache: cache?.first, returnArray: true)
 
         for (i, layer) in layers.enumerated() {
             h = layer(h, mask: mask, cache: cache?[i])

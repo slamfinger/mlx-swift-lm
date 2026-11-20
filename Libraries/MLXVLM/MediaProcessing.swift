@@ -404,7 +404,7 @@ public enum MediaProcessing {
         maxFrames: Int = Int.max,
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
-        switch video {
+        switch video.source {
         case .avAsset(let asset):
             try await Self.validateAsset(asset)
             return try await _asProcessedSequence(
@@ -580,7 +580,9 @@ public enum MediaProcessing {
         frameProcessing: (VideoFrame) throws -> VideoFrame = { $0 }
     ) async throws -> ProcessedFrames {
 
-        precondition(!videoFrames.isEmpty)
+        guard !videoFrames.isEmpty else {
+            throw VLMError.processing("Video frame input must contain at least one frame.")
+        }
 
         let startTime = videoFrames.first?.timeStamp ?? .zero
         let endTime = videoFrames.last?.timeStamp ?? .zero

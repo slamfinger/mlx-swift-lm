@@ -630,7 +630,27 @@ class MSECodec {
 ///   all compressed tokens. Zero dequantization.
 ///
 /// Both keys and values: Algorithm 1 (MSE at b bits, no QJL)
-public class TurboQuantKVCache: BaseKVCache {
+public class TurboQuantKVCache: BaseKVCache, SharedAttentionKVCache {
+    public override class var serializedClassName: String? { "TurboQuantKVCache" }
+
+    public override class func restore(
+        state: [MLXArray], metaState: [String]
+    ) throws -> any KVCache {
+        guard metaState.count >= 5,
+            let bits = Int(metaState[1]),
+            let keyBits = Int(metaState[2]),
+            let valueBits = Int(metaState[3]),
+            let seed = UInt64(metaState[4])
+        else {
+            throw KVCacheError(
+                message: "Invalid TurboQuantKVCache metaState")
+        }
+        let cache = TurboQuantKVCache(
+            bits: bits, keyBits: keyBits, valueBits: valueBits, seed: seed)
+        cache.state = state
+        cache.metaState = metaState
+        return cache
+    }
 
     public let bits: Int  // Legacy: used when keyBits == valueBits
     public let keyBits: Int  // Bit-width for key compression (0 = raw FP16, no compression)
@@ -678,6 +698,7 @@ public class TurboQuantKVCache: BaseKVCache {
     private var valPackedMSE: MLXArray?
     private var valNorms: MLXArray?
     private var compressedAllocSteps = 0
+    private var headDim: Int?
 
     /// Per-dimension key calibration scale s ∈ ℝ^dim, computed once at
     /// compressRawCache time from the full prefill K cache and reused for
@@ -800,6 +821,7 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Prefill update: store raw K/V, return raw. Zero encoding overhead.
     /// Uses KVCacheSimple-style allocation with concatenated growth.
     override public func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+        headDim = keys.dim(-1)
         let previous = self.offset
 
         let reset =
@@ -1009,6 +1031,7 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Only values are encoded via the fused Metal kernel.
     private func encodeNewToken(keys: MLXArray, values: MLXArray) {
         let headDim = keys.dim(-1)
+        self.headDim = headDim
         let B = keys.dim(0)
         let H = keys.dim(1)
         let numSteps = keys.dim(2)
@@ -1168,24 +1191,51 @@ public class TurboQuantKVCache: BaseKVCache {
         scale: Float,
         mask: MLXFast.ScaledDotProductAttentionMaskMode = .none
     ) -> MLXArray {
-        let headDim = newKeys.dim(-1)
-        let B = queries.dim(0)
-        let nQHeads = queries.dim(1)
-        let nKVHeads = newKeys.dim(1)
-        let L = queries.dim(2)
-        let nRepeats = nQHeads / nKVHeads
+        appendCompressed(keys: newKeys, values: newValues)
+        return attend(queries: queries, scale: scale, mask: mask)
+    }
 
-        // Transition: compress raw cache on first decode call
+    private func appendCompressed(keys: MLXArray, values: MLXArray) {
         if !isCompressed {
             compressRawCache()
         }
+        encodeNewToken(keys: keys, values: values)
+        isCompressed = true
+    }
 
-        // Phase A: Encode new token
-        encodeNewToken(keys: newKeys, values: newValues)
+    package func updateForAttention(keys: MLXArray, values: MLXArray) {
+        if keys.dim(2) > 1 && !isCompressed {
+            _ = update(keys: keys, values: values)
+        } else {
+            appendCompressed(keys: keys, values: values)
+        }
+    }
+
+    package func attend(
+        queries: MLXArray, scale: Float,
+        mask: MLXFast.ScaledDotProductAttentionMaskMode
+    ) -> MLXArray {
+        if !isCompressed {
+            guard let rawKeys, let rawValues else {
+                preconditionFailure("TurboQuant attention requires populated KV")
+            }
+            return MLXFast.scaledDotProductAttention(
+                queries: queries,
+                keys: rawKeys[.ellipsis, ..<offset, 0...],
+                values: rawValues[.ellipsis, ..<offset, 0...],
+                scale: scale, mask: mask)
+        }
 
         guard let valueMSECodec else {
             return queries
         }
+
+        let headDim = queries.dim(-1)
+        let B = queries.dim(0)
+        let nQHeads = queries.dim(1)
+        let nKVHeads = valPackedMSE!.dim(1)
+        let L = queries.dim(2)
+        let nRepeats = nQHeads / nKVHeads
 
         let tokenCount = offset
 
@@ -1445,6 +1495,58 @@ public class TurboQuantKVCache: BaseKVCache {
         return output.dtype == queries.dtype ? output : output.asType(queries.dtype)
     }
 
+    override public func currentKeyValues() -> (keys: MLXArray, values: MLXArray)? {
+        guard offset > 0 else { return nil }
+
+        if !isCompressed {
+            guard let rawKeys, let rawValues else { return nil }
+            return (
+                rawKeys[.ellipsis, ..<offset, 0...],
+                rawValues[.ellipsis, ..<offset, 0...]
+            )
+        }
+
+        guard let valPackedMSE, let valNorms else { return nil }
+        let resolvedHeadDim =
+            headDim ?? rawKeys?.dim(-1)
+            ?? (valPackedMSE.dim(-1) * 32 / valueBits)
+        ensureCodecs(headDim: resolvedHeadDim)
+        guard let valueMSECodec else { return nil }
+
+        let valueState = MSECodecState(
+            norms: valNorms[.ellipsis, ..<offset],
+            packedIndices: valPackedMSE[.ellipsis, ..<offset, 0...],
+            tokenCount: offset,
+            dim: resolvedHeadDim,
+            bits: valueBits)
+        let denseValues = valueMSECodec.decode(valueState)
+
+        let denseKeys: MLXArray
+        if rawKeyMode {
+            guard let rawKeys else { return nil }
+            denseKeys = rawKeys[.ellipsis, ..<offset, 0...]
+        } else if affineKeyMode {
+            guard let affKeyW, let affKeyScales, let affKeyBiases else { return nil }
+            denseKeys = dequantized(
+                affKeyW[.ellipsis, ..<offset, 0...],
+                scales: affKeyScales[.ellipsis, ..<offset, 0...],
+                biases: affKeyBiases[.ellipsis, ..<offset, 0...],
+                groupSize: keyGroupSize,
+                bits: 8)
+        } else {
+            guard let keyPackedMSE, let keyNorms, let keyMSECodec else { return nil }
+            let keyState = MSECodecState(
+                norms: keyNorms[.ellipsis, ..<offset],
+                packedIndices: keyPackedMSE[.ellipsis, ..<offset, 0...],
+                tokenCount: offset,
+                dim: resolvedHeadDim,
+                bits: keyBits)
+            denseKeys = keyMSECodec.decode(keyState, scale: keyCalibScale)
+        }
+
+        return (denseKeys, denseValues)
+    }
+
     // MARK: - Memory Reporting
 
     /// Actual memory footprint: compressed storage (packed indices + norms) for K and V,
@@ -1452,23 +1554,17 @@ public class TurboQuantKVCache: BaseKVCache {
     /// Does NOT include codec overhead (rotation matrices, codebooks) which is shared across layers.
     /// In rawKeyMode: rawKeys is always present (FP16 keys), no keyPackedMSE/keyNorms.
     public var memoryBytes: Int {
-        var total = 0
-        // Raw FP16 buffers (always present in rawKeyMode for keys, or during prefill)
-        if let rk = rawKeys { total += rk.shape.reduce(1, *) * rk.dtype.bytesPerElement }
-        if let rv = rawValues { total += rv.shape.reduce(1, *) * rv.dtype.bytesPerElement }
-        // Compressed storage (K only present when NOT rawKeyMode)
-        if let kw = affKeyW { total += kw.shape.reduce(1, *) * kw.dtype.bytesPerElement }
-        if let ks = affKeyScales { total += ks.shape.reduce(1, *) * ks.dtype.bytesPerElement }
-        if let kb = affKeyBiases { total += kb.shape.reduce(1, *) * kb.dtype.bytesPerElement }
-        if let kp = keyPackedMSE { total += kp.shape.reduce(1, *) * kp.dtype.bytesPerElement }
-        if let kn = keyNorms { total += kn.shape.reduce(1, *) * kn.dtype.bytesPerElement }
-        if let vp = valPackedMSE { total += vp.shape.reduce(1, *) * vp.dtype.bytesPerElement }
-        if let vn = valNorms { total += vn.shape.reduce(1, *) * vn.dtype.bytesPerElement }
-        if let kcs = keyCalibScale { total += kcs.shape.reduce(1, *) * kcs.dtype.bytesPerElement }
-        return total
+        innerState().reduce(0) { $0 + $1.nbytes }
     }
 
     // MARK: - State / Trim
+
+    override public func innerState() -> [MLXArray] {
+        [
+            rawKeys, rawValues, affKeyW, affKeyScales, affKeyBiases,
+            keyPackedMSE, keyNorms, valPackedMSE, valNorms, keyCalibScale,
+        ].compactMap { $0 }
+    }
 
     override public var state: [MLXArray] {
         get {
@@ -1569,13 +1665,19 @@ public class TurboQuantKVCache: BaseKVCache {
 
     override public var metaState: [String] {
         get {
-            ["\(offset)", "\(bits)", "\(keyBits)", "\(valueBits)", "\(seed)"]
+            [
+                "\(offset)", "\(bits)", "\(keyBits)", "\(valueBits)", "\(seed)",
+                headDim.map(String.init) ?? "None",
+            ]
         }
         set {
             guard newValue.count >= 5,
                 let o = Int(newValue[0])
             else { return }
             offset = o
+            if newValue.count >= 6, newValue[5] != "None" {
+                headDim = Int(newValue[5])
+            }
         }
     }
 
@@ -1600,6 +1702,33 @@ public class TurboQuantKVCache: BaseKVCache {
             isCompressed = false
         }
         return trimCount
+    }
+
+    override public func copy() -> any KVCache {
+        let new = TurboQuantKVCache(
+            bits: bits, keyBits: keyBits, valueBits: valueBits, seed: seed,
+            keyGroupSize: keyGroupSize)
+        new.offset = offset
+        new.headDim = headDim
+        new.keyMSECodec = keyMSECodec
+        new.valueMSECodec = valueMSECodec
+        // Like `state`, keep only the positions this cache holds. A slice is a new array
+        // object, so a write to either cache rebinds only its own arrays.
+        func held(_ array: MLXArray?) -> MLXArray? { array?[0..., 0..., ..<offset] }
+        new.affKeyW = held(affKeyW)
+        new.affKeyScales = held(affKeyScales)
+        new.affKeyBiases = held(affKeyBiases)
+        new.rawKeys = held(rawKeys)
+        new.rawValues = held(rawValues)
+        new.rawAllocSteps = new.rawKeys?.dim(2) ?? 0
+        new.keyPackedMSE = held(keyPackedMSE)
+        new.keyNorms = held(keyNorms)
+        new.valPackedMSE = held(valPackedMSE)
+        new.valNorms = held(valNorms)
+        new.compressedAllocSteps = new.valPackedMSE?.dim(2) ?? 0
+        new.keyCalibScale = keyCalibScale?[.ellipsis]
+        new.isCompressed = isCompressed
+        return new
     }
 }
 

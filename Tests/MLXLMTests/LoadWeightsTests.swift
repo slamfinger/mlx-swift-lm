@@ -70,7 +70,92 @@ private final class FailingInferenceStateModel: Module, LanguageModel,
     }
 }
 
+/// A model whose `sanitize` raises an MLX error and passes on the failed result.
+private final class MLXErrorSanitizingModel: Module, BaseLanguageModel {
+    @ModuleInfo(key: "layer") var layer = Linear(2, 2, bias: false)
+
+    func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws
+        -> [String: MLXArray]
+    {
+        var weights = weights
+        weights["layer.weight"] = weights["layer.weight"]?.transposed(0, 2, 1)
+        return weights
+    }
+}
+
+/// Drops `unused` from its checkpoint and replaces its weight in `prepare()`, the way Qwen 3.5
+/// fuses its input projections.
+private final class ReplacingModel: Module, LanguageModel, KVCacheDimensionProvider {
+    static let size = 2048
+    @ModuleInfo(key: "layer") var layer = Linear(size, size, bias: false)
+    let kvHeads: [Int] = []
+
+    func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        weights.filter { $0.key != "unused" }
+    }
+
+    func prepare() throws {
+        try layer.update(
+            parameters: ModuleParameters.unflattened([
+                "weight": MLXArray.zeros([Self.size, Self.size])
+            ]), verify: .none)
+    }
+
+    func prepare(
+        _ input: LMInput, cache: [KVCache], state: LMOutput.State?, prefill: PrefillParameters
+    ) throws -> PrepareResult {
+        .tokens(input.text)
+    }
+
+    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
+        layer(inputs)
+    }
+}
+
 final class LoadWeightsTests: XCTestCase {
+
+    // MARK: - MLX errors on the loader's threads
+
+    /// Called directly, so no other error scope covers the worker.
+    func testAnMLXErrorOnALoadWorkerThreadIsThrown() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        // A sparse file holding one 256 GiB tensor, more than one Metal buffer
+        // holds: reading it fails on a load worker thread.
+        let shape = [1 << 19, 1 << 19]
+        let count = shape.reduce(1, *)
+        let header = try JSONSerialization.data(withJSONObject: [
+            "layer.weight": ["dtype": "U8", "shape": shape, "data_offsets": [0, count]]
+        ])
+        let url = directory.appendingPathComponent("model.safetensors")
+        var file = withUnsafeBytes(of: UInt64(header.count).littleEndian) { Data($0) }
+        file.append(header)
+        try file.write(to: url)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.truncate(atOffset: UInt64(file.count + count))
+        try handle.close()
+
+        XCTAssertThrowsError(try loadModelCheckpoint(urls: [url])) {
+            XCTAssertTrue($0 is MLXError, "\($0)")
+        }
+    }
+
+    /// The MLX error is thrown, not the shape mismatch its failed result causes later.
+    func testAnMLXErrorInSanitizeOnTheLoadThreadIsThrown() async throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try save(
+            arrays: ["layer.weight": MLXArray.zeros([2, 2])],
+            url: directory.appendingPathComponent("model.safetensors"))
+
+        do {
+            try await loadWeights(modelDirectory: directory, model: MLXErrorSanitizingModel())
+            XCTFail("expected the MLX error from sanitize")
+        } catch {
+            XCTAssertTrue(error is MLXError, "\(error)")
+        }
+    }
 
     // MARK: - Concurrent loading
 
@@ -447,6 +532,26 @@ final class LoadWeightsTests: XCTestCase {
         } catch {
             // expected
         }
+    }
+
+    // Tensors the model drops or replaces must not stay in the buffer cache after the load.
+    func testLoadWeightsReleasesTheTensorsTheModelDoesNotKeep() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let size = ReplacingModel.size
+        try save(
+            arrays: [
+                "layer.weight": MLXArray.ones([size, size]),
+                "unused": MLXArray.ones([size, size]),
+            ],
+            url: directory.appendingPathComponent("model.safetensors"))
+
+        let model = ReplacingModel()
+        try loadWeights(modelDirectory: directory, model: model)
+
+        XCTAssertLessThan(Memory.cacheMemory, size * size * 4 / 2)
+        XCTAssertEqual(model.layer.weight.sum().item(Float.self), 0)
     }
 
     /// Writes a checkpoint whose index names only `model.safetensors` while the head lives in

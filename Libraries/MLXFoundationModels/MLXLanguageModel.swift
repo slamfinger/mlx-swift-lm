@@ -15,283 +15,7 @@ import Foundation
 import FoundationModels
 import MLXLMCommon
 import MLX
-import os.log
 import MLXGuidedGeneration
-
-// MARK: - Constraint Cache Kind
-
-/// Selects which xgrammar constructor a cached template was compiled
-/// with. Used by the constraint cache so a JSON-schema source and a
-/// structural-tag source can never alias even if their text collides.
-enum ConstraintKind {
-    case json
-    case structuralTag
-}
-
-// MARK: - Tokenizer Bias Cache Entry
-
-/// Tokenizer-derived logit biases, cached per model. Both arrays are pure
-/// functions of the tokenizer, so they are identical for a model's lifetime.
-/// `@unchecked Sendable`: every field is `let` and read-only after construction
-/// (the arrays are only *added* to logits in `GuidedGenerationLoop`, never
-/// mutated), and the entry is shared across actors via `ModelCache` — the same
-/// pattern as `GrammarTokenizer`/`GrammarConstraint` in `XGrammarBridge.swift`.
-final class TokenizerBias: @unchecked Sendable {
-    let closing: MLXArray
-    let whitespace: MLXArray
-    let whitespaceTokenIDs: Set<Int>
-
-    init(closing: MLXArray, whitespace: MLXArray, whitespaceTokenIDs: Set<Int>) {
-        self.closing = closing
-        self.whitespace = whitespace
-        self.whitespaceTokenIDs = whitespaceTokenIDs
-    }
-}
-
-// MARK: - Model Cache Actor
-
-/// Thread-safe model cache using Swift actor isolation.
-/// Prevents race conditions when multiple concurrent requests try to load the model.
-/// Supports caching multiple models by their identifiers.
-private actor ModelCache {
-    /// Class wrapper around `Task` so actor-reentrancy supersession guards can
-    /// use `===` identity comparison. `Task` is a value type; a wrapper lets us
-    /// detect whether `evictAll()` replaced a loading entry mid-flight.
-    private final class LoadTask {
-        let task: Task<ModelContainer, Error>
-        init(_ task: Task<ModelContainer, Error>) { self.task = task }
-    }
-
-    private var containers: [String: ModelContainer] = [:]
-    private var loadingTasks: [String: LoadTask] = [:]
-    /// In-flight loads tagged as a warmup of an already-present model, which
-    /// must NOT surface as `.downloading` (there is no user-facing download).
-    /// A subset of `loadingTasks`' keys. See `load` and `isDownloading`.
-    private var suppressedLoadIDs: Set<String> = []
-    private var xgTokenizers: [String: GrammarTokenizer] = [:]
-    /// Cached compiled constraint templates keyed by (modelID, schemaJSON).
-    /// Clone from template instead of recompiling the grammar each request.
-    private var constraintTemplates: [String: GrammarConstraint] = [:]
-    /// Cached per-model logit biases (closing + whitespace). Pure functions of
-    /// the tokenizer, so computed once per model and reused across requests.
-    private var tokenizerBiases: [String: TokenizerBias] = [:]
-    /// Most recent load error per model. Cleared on a subsequent successful
-    /// load. Surfaced through `MLXLanguageModel.availability` so callers can
-    /// distinguish "never tried" from "tried and failed".
-    private var lastErrors: [String: any Error] = [:]
-
-    /// Gets the cached model container for the given model ID, loading it if necessary.
-    /// Concurrent callers for the same model will share the same loading task, preventing duplicate loads.
-    ///
-    /// The `loader` closure carries the transport types (downloader, tokenizer
-    /// loader). Keeping them out of the cache means the cache itself stays
-    /// agnostic of how a container is acquired -- first caller wins; later
-    /// callers reuse the cached container regardless of which loader they
-    /// brought along.
-    func load(
-        modelID: String,
-        suppressDownloadingState: Bool = false,
-        loader: @Sendable @escaping () async throws -> ModelContainer
-    ) async throws -> ModelContainer {
-        if let cached = containers[modelID] {
-            return cached
-        }
-
-        if let existingLoadTask = loadingTasks[modelID] {
-            // Coalesced onto an in-flight load: the first caller's
-            // classification (downloading vs. suppressed) stands — we do not
-            // re-tag. This collision is benign because the suppress decision is
-            // conditioned on disk-presence: a warmup and a genuine download for
-            // a not-yet-present model both classify as downloading, so they
-            // agree; when the model IS present, `availability` resolves to
-            // `.available` regardless of the in-flight load.
-            return try await existingLoadTask.task.value
-        }
-
-        let loadTask = LoadTask(
-            Task<ModelContainer, Error> {
-                try await loader()
-            })
-        loadingTasks[modelID] = loadTask
-        // Tag a warmup-of-an-already-present model out of the `.downloading`
-        // signal (computed by the caller as warmup AND modelExistsOnDisk()).
-        if suppressDownloadingState {
-            suppressedLoadIDs.insert(modelID)
-        }
-
-        do {
-            let loaded = try await loadTask.task.value
-            // Supersession guard: `evict()`/`evictAll()` may have removed this
-            // load while it was suspended (actor reentrancy). If we are no longer
-            // the registered task, hand the awaiter its container but do NOT
-            // re-populate the cache — ARC frees the weights when the awaiter
-            // releases it.
-            guard loadingTasks[modelID] === loadTask else { return loaded }
-            containers[modelID] = loaded
-            loadingTasks[modelID] = nil
-            suppressedLoadIDs.remove(modelID)
-            lastErrors[modelID] = nil
-            return loaded
-        } catch {
-            // Same guard on the failure path: a superseded load must not re-add a
-            // stale lastErrors entry for a model nobody holds.
-            if loadingTasks[modelID] === loadTask {
-                loadingTasks[modelID] = nil
-                suppressedLoadIDs.remove(modelID)
-                lastErrors[modelID] = error
-            }
-            throw error
-        }
-    }
-
-    /// Whether a *genuine download* is in flight for the given model: a load
-    /// task is running and it was not tagged as a warmup of an already-present
-    /// model. Drives `availability`'s `.downloading` state, so a background
-    /// warmup of an already-downloaded model does not spuriously report
-    /// `.downloading`. (A warmup that triggers a real fetch is not tagged and
-    /// does report here.)
-    func isDownloading(modelID: String) -> Bool {
-        loadingTasks[modelID] != nil && !suppressedLoadIDs.contains(modelID)
-    }
-
-    /// The most recent load error for the given model, if a previous attempt
-    /// failed and no successful load has happened since.
-    func lastError(modelID: String) -> (any Error)? {
-        lastErrors[modelID]
-    }
-
-    /// Gets or creates a cached GrammarTokenizer for the given model.
-    func makeXGTokenizer(
-        modelID: String,
-        tokenizer: any Tokenizer
-    ) throws -> GrammarTokenizer {
-        if let cached = xgTokenizers[modelID] {
-            return cached
-        }
-        let vocab = TokenizerVocabExtractor.extractForGrammar(from: tokenizer)
-        let xgTok = try GrammarTokenizer(
-            vocab: vocab.vocab,
-            vocabType: vocab.vocabType,
-            eosTokenId: Int32(tokenizer.eosTokenId ?? 0)
-        )
-        xgTokenizers[modelID] = xgTok
-        return xgTok
-    }
-
-    /// Whether an `GrammarTokenizer` is already cached for the given model.
-    /// Used by `MLXLanguageModel.hasCachedXGTokenizer` so tests can assert
-    /// that `warmUp()` pre-created it (a genuine cache hit) rather than only
-    /// that a later guided respond happens to succeed.
-    func hasCachedXGTokenizer(modelID: String) -> Bool {
-        xgTokenizers[modelID] != nil
-    }
-
-    /// Gets or creates the cached tokenizer-derived logit biases for a model.
-    func makeTokenizerBias(
-        modelID: String,
-        tokenizer: any Tokenizer
-    ) -> TokenizerBias {
-        if let cached = tokenizerBiases[modelID] {
-            return cached
-        }
-        let closing = ClosingTokenBias.compute(
-            tokenizer: tokenizer,
-            eosTokenId: tokenizer.eosTokenId
-        )
-        let (whitespace, whitespaceTokenIDs) = WhitespaceTokenBias.compute(
-            tokenizer: tokenizer
-        )
-        let bias = TokenizerBias(
-            closing: closing,
-            whitespace: whitespace,
-            whitespaceTokenIDs: whitespaceTokenIDs
-        )
-        tokenizerBiases[modelID] = bias
-        return bias
-    }
-
-    /// Gets a fresh constraint by cloning a cached template, or compiles and caches one first.
-    ///
-    /// Grammar compilation is expensive (~5-20ms). By caching the compiled template
-    /// and cloning it (~0.1ms), repeated requests with the same schema skip recompilation.
-    /// When Fork() is unavailable (xgrammar < v0.1.34), the clone attempt fails gracefully
-    /// and each request compiles a fresh constraint instead.
-    func makeConstraint(
-        modelID: String,
-        kind: ConstraintKind,
-        source: String,
-        tokenizer: GrammarTokenizer,
-        hostTokenizer: any Tokenizer,
-        fastForward: Bool
-    ) throws -> GrammarConstraint {
-        let cacheKey = "\(modelID):\(kind):\(source)"
-        if let template = constraintTemplates[cacheKey] {
-            do {
-                return try template.clone()
-            } catch GrammarError.forkFailed {
-                constraintTemplates.removeValue(forKey: cacheKey)
-            }
-        }
-        let constraint: GrammarConstraint
-        switch kind {
-        case .json:
-            constraint = try GrammarConstraint(
-                tokenizer: tokenizer,
-                jsonSchema: source,
-                fastForward: fastForward,
-                hostTokenizer: hostTokenizer
-            )
-        case .structuralTag:
-            constraint = try GrammarConstraint(
-                tokenizer: tokenizer,
-                structuralTag: source,
-                fastForward: fastForward,
-                hostTokenizer: hostTokenizer
-            )
-        }
-        if let cloned = try? constraint.clone() {
-            constraintTemplates[cacheKey] = constraint
-            return cloned
-        }
-        return constraint
-    }
-
-    /// Evicts all cached state: model containers, tokenizers, constraint
-    /// templates, and per-model tokenizer biases. No GPU-stream synchronization
-    /// is required — in-flight callers retain their own `ModelContainer` and
-    /// free it via ARC on completion.
-    func evictAll() {
-        containers.removeAll()
-        loadingTasks.removeAll()
-        suppressedLoadIDs.removeAll()
-        xgTokenizers.removeAll()
-        constraintTemplates.removeAll()
-        tokenizerBiases.removeAll()
-        lastErrors.removeAll()
-    }
-
-    /// Evicts a single model's state across every per-model cache: its container,
-    /// xgrammar tokenizer, all compiled constraint templates, tokenizer bias,
-    /// last load error, the suppressed-download tag, and any in-flight load
-    /// registration.
-    /// Best-effort cancels an in-flight load (the load path is not
-    /// cancellation-aware today, so this is a no-op safety net); the
-    /// load-completion guard in `load()` is what prevents a superseded load
-    /// from re-populating after removal.
-    func remove(modelID: String) {
-        // `loadingTasks` holds a `LoadTask` box; cancel the wrapped `Task`.
-        loadingTasks[modelID]?.task.cancel()
-        loadingTasks.removeValue(forKey: modelID)
-        suppressedLoadIDs.remove(modelID)
-        containers.removeValue(forKey: modelID)
-        xgTokenizers.removeValue(forKey: modelID)
-        constraintTemplates = constraintTemplates.filter {
-            !$0.key.hasPrefix("\(modelID):")
-        }
-        tokenizerBiases.removeValue(forKey: modelID)
-        lastErrors.removeValue(forKey: modelID)
-    }
-}
 
 // MARK: - MLXLanguageModel
 
@@ -324,12 +48,12 @@ private actor ModelCache {
 ///         }
 ///         return cache.repoDirectory(repo: repo, kind: .model)
 ///     },
-///     load: { configuration, progressHandler in
+///     load: { configuration, progress in
 ///         try await loadModelContainer(
 ///             from: #hubDownloader(),
 ///             using: #huggingFaceTokenizerLoader(),
 ///             configuration: configuration,
-///             progressHandler: progressHandler)
+///             progress: progress)
 ///     })
 /// let session = LanguageModelSession(model: model, tools: [], instructions: nil)
 /// let response = try await session.respond(to: "Hello!")
@@ -362,13 +86,28 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     /// Loads the model container for a configuration, forwarding download
     /// progress. Injected so this module carries no HuggingFace or
     /// swift-transformers dependency; the HuggingFace wiring lives in callers.
+    ///
+    /// This closure must honor cancellation while it is suspended. ``evict()``
+    /// and ``evictAll()`` cancel the load task tied to this closure. A closure
+    /// that ignores cancellation keeps running and keeps its caller waiting.
+    @available(
+        *, deprecated, message: "Use ProgressContainerLoader with the progress-aware initializer"
+    )
     public typealias ContainerLoader =
         @Sendable (
             _ configuration: ModelConfiguration,
             _ progressHandler: @Sendable @escaping (Progress) -> Void
         ) async throws -> ModelContainer
 
-    private let load: ContainerLoader
+    /// A container loader that receives phase-specific download and weight progress.
+    public typealias ProgressContainerLoader =
+        @Sendable (
+            _ configuration: ModelConfiguration,
+            _ progress: LoadProgressHandlers
+        ) async throws -> ModelContainer
+
+    private let load: ProgressContainerLoader
+    private let progress: LoadProgressHandlers
 
     /// Stable identity for the model cache, executor configuration, tokenizer
     /// caches, availability, and progress reporting. Derived from the
@@ -406,24 +145,35 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     private func makeContainerLoader() -> @Sendable () async throws -> ModelContainer {
         let configuration = self.configuration
         let load = self.load
+        let configuredProgress = self.progress
         return {
             // Configure the buffer pool once per process rather than on every
             // load, so a consumer's own `Memory.cacheLimit` survives our loads.
             _ = Self.configureGPUCacheOnce
-            let container = try await load(configuration) { progress in
-                MLXDownloadProgress.report(progress: progress, modelID: configuration.name)
-            }
-            MLXDownloadProgress.reportCompleted()
-            return container
+            // One identifier per load attempt. Eviction cancels a load and
+            // forgets it at once, so a replacement can start while this one is
+            // still unwinding, and the progress observable needs to tell them
+            // apart.
+            let loadID = UUID()
+            MLXDownloadProgress.reportStarted(modelID: configuration.name, loadID: loadID)
+            defer { MLXDownloadProgress.reportEnded(modelID: configuration.name, loadID: loadID) }
+            let progress = LoadProgressHandlers(
+                download: { progress in
+                    MLXDownloadProgress.report(
+                        progress: progress, modelID: configuration.name, loadID: loadID)
+                    configuredProgress.download?(progress)
+                },
+                weights: configuredProgress.weights)
+            return try await load(configuration, progress)
         }
     }
 
     /// Gets or creates a cached GrammarTokenizer for the given model.
-    static func makeXGTokenizer(
+    static func makeGrammarTokenizer(
         modelID: String,
         tokenizer: any Tokenizer
     ) async throws -> GrammarTokenizer {
-        try await cache.makeXGTokenizer(modelID: modelID, tokenizer: tokenizer)
+        try await cache.makeGrammarTokenizer(modelID: modelID, tokenizer: tokenizer)
     }
 
     /// Gets the cached per-model tokenizer-derived logit biases (closing +
@@ -457,18 +207,27 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     /// Whether the shared cache already holds an `GrammarTokenizer` for the model.
     /// Internal test seam (not public API): lets `PrewarmGrammarTests` confirm
     /// `warmUp()` pre-created the tokenizer.
-    static func hasCachedXGTokenizer(modelID: String) async -> Bool {
-        await cache.hasCachedXGTokenizer(modelID: modelID)
+    static func hasCachedGrammarTokenizer(modelID: String) async -> Bool {
+        await cache.hasCachedGrammarTokenizer(modelID: modelID)
     }
 
     /// Evicts every cached model, tokenizer, constraint template, and per-model
     /// tokenizer bias, freeing the GPU memory held by model weights. Subsequent
-    /// requests reload from the on-disk cache.
+    /// requests reload from the on-disk cache. Cancels every registered
+    /// in-flight load task, the same way ``evict()`` does for one model.
     ///
-    /// Safe to call during in-flight `respond()`/`warmUp()` work: each holds its
-    /// own strong reference to the `ModelContainer` and synchronizes the GPU on
-    /// exit, so dropping the cache's reference cannot free weights out from under
-    /// a live kernel — the weights free via ARC once that work returns.
+    /// Safe to call during in-flight `respond()`/`warmUp()` work that already holds
+    /// a `ModelContainer`: that work keeps its own strong reference and synchronizes
+    /// the GPU on exit, so dropping the cache's reference cannot free weights out
+    /// from under a live kernel — the weights free via ARC once that work returns.
+    ///
+    /// Work still inside its load phase is the other case. This call cancels every
+    /// registered load task, so if the loader honors cancellation, an awaiting
+    /// `preload()` or `respond()` fails instead of completing. The loader decides
+    /// the error type, so it may not be `CancellationError`. The cache coalesces
+    /// concurrent callers for one model onto a single load task, so one such
+    /// failure reaches every caller waiting on that load, including callers that
+    /// never asked for an eviction.
     public static func evictAll() async {
         await cache.evictAll()
     }
@@ -479,8 +238,10 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     ///
     /// Safe to call during an in-flight `respond()`: that call retains its own
     /// `ModelContainer` and finishes normally; the weights free via ARC once it
-    /// returns. Evicting a model whose load is still in flight removes it cleanly
-    /// — the in-flight load completes but does not re-populate the cache.
+    /// returns. Evicting a model with an in-flight load cancels that load's task.
+    /// If the loader honors cancellation, the awaiting `preload()` or `respond()`
+    /// call fails instead of completing. The loader decides the error type, so it
+    /// may not be `CancellationError`.
     public func evict() async {
         await Self.cache.remove(modelID: modelID)
     }
@@ -506,10 +267,11 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     /// `.allowed` tool routing, guided `.required` developer tool calls,
     /// and reasoning (chain-of-thought) routing.
     ///
-    /// Capabilities are declared explicitly by the caller at ``init(configuration:capabilities:configurationResolver:weightsLocation:load:)``
+    /// Capabilities are declared explicitly by the caller at
+    /// ``init(configuration:capabilities:configurationResolver:prefillStepSize:weightsLocation:progress:load:)``
     /// and stored verbatim. The caller includes
     /// `.guidedGeneration`/`.toolCalling`/`.reasoning` as appropriate; the
-    /// adapter does not consult ``ReasoningHeuristics`` (which remains a
+    /// adapter does not consult `ReasoningHeuristics` (which remains a
     /// standalone helper a caller may use to compute their own capability set).
     ///
     /// Declaring `.reasoning` matters for request routing: the framework only
@@ -519,10 +281,13 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     /// capability was declared.
     public let capabilities: LanguageModelCapabilities
 
-    /// The configuration resolver that patches a per-call ``ModelConfiguration``
+    /// The configuration resolver that patches a per-call `ModelConfiguration`
     /// for this instance. Defaults to ``DefaultConfigurationResolver`` when
     /// omitted.
     public let configurationResolver: any ModelConfigurationResolver
+
+    /// Prompt prefill step size; `nil` uses the default step size.
+    public let prefillStepSize: Int?
 
     /// Configuration the framework uses to create and cache executors.
     public var executorConfiguration: Executor.Configuration {
@@ -540,8 +305,9 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     ///   - capabilities: The capabilities this model supports
     ///     (`.guidedGeneration`, `.toolCalling`, `.reasoning`, `.vision`).
     ///     Stored verbatim; the adapter never infers or expands the set.
-    ///   - configurationResolver: Patches a per-call ``ModelConfiguration``
+    ///   - configurationResolver: Patches a per-call `ModelConfiguration`
     ///     (reasoning config, extra stop tokens) for this instance.
+    ///   - prefillStepSize: Prompt prefill step size. `nil` uses the default step size.
     ///   - weightsLocation: Resolves a model identifier to its on-disk weights
     ///     directory, for the availability checks.
     ///   - load: Loads the model container for a configuration.
@@ -553,19 +319,51 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     ///     URL(fileURLWithPath: "/Volumes/SharedCache/models/\(id)")
     /// }
     /// ```
+    @_disfavoredOverload
+    @available(*, deprecated, message: "Use init(..., progress:load:)")
     public init(
         configuration: ModelConfiguration,
         capabilities: [LanguageModelCapabilities.Capability] = [.guidedGeneration],
         configurationResolver: any ModelConfigurationResolver =
             DefaultConfigurationResolver(),
+        prefillStepSize: Int? = nil,
         weightsLocation: @Sendable @escaping (String) -> URL,
         load: @escaping ContainerLoader
     ) {
         self.configuration = configuration
         self.capabilities = LanguageModelCapabilities(capabilities)
         self.configurationResolver = configurationResolver
+        self.prefillStepSize = prefillStepSize
+        self.weightsLocation = weightsLocation
+        self.load = { configuration, progress in
+            try await load(configuration, progress.download ?? { _ in })
+        }
+        self.progress = .init()
+    }
+
+    /// Creates an `MLXLanguageModel` whose loader receives phase-specific model
+    /// loading progress.
+    ///
+    /// Use this initializer when the loader forwards `LoadProgressHandlers` to
+    /// `loadModelContainer`. The deprecated `load:` initializer remains available
+    /// for source compatibility with download-only loaders.
+    public init(
+        configuration: ModelConfiguration,
+        capabilities: [LanguageModelCapabilities.Capability] = [.guidedGeneration],
+        configurationResolver: any ModelConfigurationResolver =
+            DefaultConfigurationResolver(),
+        prefillStepSize: Int? = nil,
+        weightsLocation: @Sendable @escaping (String) -> URL,
+        progress: LoadProgressHandlers = .init(),
+        load: @escaping ProgressContainerLoader
+    ) {
+        self.configuration = configuration
+        self.capabilities = LanguageModelCapabilities(capabilities)
+        self.configurationResolver = configurationResolver
+        self.prefillStepSize = prefillStepSize
         self.weightsLocation = weightsLocation
         self.load = load
+        self.progress = progress
     }
 
     /// Downloads the model and loads its weights into memory.
@@ -636,7 +434,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         // per-request schema/tool grammar that prewarm doesn't possess — a
         // pre-built constraint would land under a key no real respond() reads.
         let tokenizer = await container.tokenizer
-        _ = try await Self.makeXGTokenizer(
+        _ = try await Self.makeGrammarTokenizer(
             modelID: modelID, tokenizer: tokenizer)
 
         // Force Metal shader JIT with a minimal 1-token generate, run inside
@@ -651,7 +449,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             defer { Stream.gpu.synchronize() }
             let input = try await context.processor.prepare(
                 input: UserInput(chat: [.user("warmup")]))
-            let params = GenerateParameters(maxTokens: 1)
+            let params = GenerateParameters(
+                maxTokens: 1, prefill: .init(stepSize: prefillStepSize))
             for await _ in try MLXLMCommon.generate(
                 input: input, parameters: params, context: context
             ) {
@@ -801,7 +600,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         static func makeParameters(
             maxTokens: Int,
             requestedTemperature: Double?,
-            samplingConfiguration: MLXSamplingConfiguration?
+            samplingConfiguration: MLXSamplingConfiguration?,
+            prefillStepSize: Int?
         ) -> GenerateParameters {
             var parameters = GenerateParameters(maxTokens: maxTokens)
             resolveSamplingParameters(
@@ -809,6 +609,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                 clampedTemperature: clampedTemperature(requestedTemperature)
             ).apply(to: &parameters)
             parameters.seed = samplingConfiguration?.seed
+            parameters.prefill.stepSize = prefillStepSize
             return parameters
         }
 
@@ -863,10 +664,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         /// prewarm (bad id, network gone, OOM). Note it cannot intercept a
         /// Metal command-buffer assertion abort — that is a process crash, not
         /// a catchable Swift error.
-        private static let logger = Logger(
-            subsystem: "com.apple.FoundationModels-MLX", category: "Prewarm")
-        private static let protocolLogger = Logger(
-            subsystem: "com.apple.FoundationModels-MLX", category: "TokenStreamProtocol")
+        private static let logger = MLXLogger(label: "Prewarm")
+        private static let protocolLogger = MLXLogger(label: "TokenStreamProtocol")
 
         /// Prewarms the model: loads weights and pre-compiles Metal shaders so
         /// the first `respond()` pays no cold-start shader-JIT cost.
@@ -895,7 +694,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     try await model.warmUp()
                 } catch {
                     Self.logger.error(
-                        "MLX prewarm failed for \(model.modelID, privacy: .public): \(error.localizedDescription, privacy: .public)"
+                        "MLX prewarm failed for \(model.modelID): \(error.localizedDescription)"
                     )
                 }
             }
@@ -912,22 +711,16 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             model: MLXLanguageModel,
             streamingInto channel: LanguageModelExecutorGenerationChannel
         ) async throws {
-            var collected = TranscriptConverter.mlxMessages(for: request.transcript)
+            var collected = try TranscriptConverter.mlxMessages(for: request.transcript)
             // MLX tokenizer crashes on empty chat input; provide a fallback.
             if collected.isEmpty {
                 collected = [Chat.Message.user("")]
             }
-            let messages = collected
 
-            // Vision capability gate (adapter-side). Labeled image
-            // attachments arrive as public `.attachment` segments that
-            // the SDK's own vision guard never inspects, so the adapter
-            // is the only place that can enforce `.vision` for this path.
-            // Throw the same typed error the SDK would, before loading
-            // any weights, so a model declared without `.vision` fails
-            // fast and identically across the tool / schema / plain paths.
+            // The SDK's vision check does not cover `.attachment` segments, so the adapter
+            // must enforce `.vision` for image attachments itself.
             if !model.capabilities.contains(.vision),
-                messages.contains(where: { !$0.images.isEmpty })
+                collected.contains(where: { !$0.images.isEmpty })
             {
                 throw LanguageModelError.unsupportedCapability(
                     LanguageModelError.UnsupportedCapability(
@@ -953,6 +746,14 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                 schemaJSON = nil
             }
 
+            // Guided generation adds the schema, including its @Guide descriptions,
+            // to the system prompt, so the model sees more than the grammar.
+            // `includeSchemaInPrompt` refers to the system prompt. Tool-aware
+            // prompts are unchanged.
+            let promptMessages = TranscriptConverter.promptMessages(
+                collected, schemaJSON: schemaJSON,
+                includeSchemaInPrompt: request.contextOptions.includeSchemaInPrompt)
+
             let modelID = self.modelID
             let requestedMaxTokens = request.generationOptions.maximumResponseTokens
             // Translate the SDK sampling mode once, here where generationOptions
@@ -973,6 +774,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             // reasoning config we route on.
             let declaresReasoning = model.capabilities.contains(.reasoning)
             let configurationResolver = model.configurationResolver
+            let prefillStepSize = model.prefillStepSize
+            let labeledAttachments = TranscriptConverter.labeledAttachments(in: request.transcript)
 
             do {
                 // Send metadata first
@@ -980,13 +783,17 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     ["modelID": modelID, "requestID": request.id.uuidString],
                     entryID: entryID, into: channel)
 
-                // Generate tokens inside actor isolation. `messages` carries
+                // Generate tokens inside actor isolation. `promptMessages` carries
                 // non-Sendable `Chat.Message` instances (UserInput.Image and
-                // .Video are not Sendable), so route the array through
+                // .Video are not Sendable), so route it through
                 // perform(nonSendable:_:) which boxes it across the actor hop.
-                try await container.perform(nonSendable: messages) { context, messages in
-                    // Render the prompt through the model's UserInputProcessor.
-                    let userInput = UserInput(chat: messages)
+                try await container.perform(nonSendable: promptMessages) {
+                    context, promptMessages in
+                    try AttachmentLabelValidator.default.validate(
+                        labeledAttachments, with: context.tokenizer)
+
+                    // Render the guided-generation prompt through the model's UserInputProcessor.
+                    let userInput = UserInput(chat: promptMessages.withSchema)
                     let input = try await context.processor.prepare(input: userInput)
 
                     // Resolve the per-instance configuration. Held strictly as
@@ -1064,7 +871,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                         let suppressionConfig = resolved.reasoningConfig
                     {
                         suppressedInput = try await Self.preparedInput(
-                            messages: messages, config: suppressionConfig,
+                            messages: promptMessages.withoutSchema, config: suppressionConfig,
                             thinkingEnabled: false, processor: context.processor,
                             cannotDisableMessage:
                                 "This model always reasons; .reasoning must be declared at MLXLanguageModel init to receive its output."
@@ -1081,7 +888,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                         let thinkingEnabled = Self.thinkingEnabled(
                             for: request.contextOptions.reasoningLevel)
                         let reasoningInput = try await Self.preparedInput(
-                            messages: messages, config: reasoningConfig,
+                            messages: promptMessages.withoutSchema, config: reasoningConfig,
                             thinkingEnabled: thinkingEnabled, processor: context.processor,
                             cannotDisableMessage:
                                 "This model always reasons; reasoning cannot be disabled via reasoningLevel."
@@ -1118,23 +925,38 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                         // models are tool-blind (template ignores `tools:`), so
                         // they fall through to the single-phase path unchanged;
                         // thinking-disabled requests stay single-phase too.
+                        //
+                        // An unspecified level resolves through the template's own
+                        // `defaultOn`, exactly as the prompt does below. If the two
+                        // disagree the phase asks for reasoning the prompt suppressed,
+                        // burning `maxTokens` without producing a tool call.
                         let thinkThenCallConfig: ReasoningConfig? = {
                             guard declaresReasoning,
                                 let cfg = resolved.reasoningConfig,
-                                case .templateFlag = cfg.promptStrategy,
+                                case .templateFlag(_, let defaultOn) = cfg.promptStrategy,
                                 Self.thinkingEnabled(
-                                    for: request.contextOptions.reasoningLevel) != false
+                                    for: request.contextOptions.reasoningLevel,
+                                    defaultOn: defaultOn)
                             else { return nil }
                             return cfg
                         }()
+                        // Routing keys on the declaration alone, never on the level: a
+                        // model can open its channel even when the template was told
+                        // not to think, as Gemma 4 does on the post-tool turns this
+                        // path serves. Deriving this from `thinkThenCallConfig` would
+                        // leave those markers in the answer.
+                        let routedReasoningConfig: ReasoningConfig? =
+                            declaresReasoning ? resolved.reasoningConfig : nil
                         // Thread `enable_thinking` through the tool-aware template
                         // so the prompt's thinking state matches how we drive
                         // generation. For a toggleable model (`.templateFlag`, e.g.
                         // Qwen3 whose `enable_thinking` defaults ON) the effective
                         // value is:
-                        //   - reasoning declared: honor the requested level
-                        //     (default ON), and the think-then-call phase below
-                        //     lets the model reason before the grammar constrains it;
+                        //   - reasoning declared: honor the requested level, falling
+                        //     back to the template's own `defaultOn` when the caller
+                        //     gave none (ON for Qwen3, OFF for Gemma 4), and the
+                        //     think-then-call phase below lets the model reason
+                        //     before the grammar constrains it;
                         //   - reasoning NOT declared: force thinking OFF, mirroring
                         //     the unconstrained path's suppression (see
                         //     `suppressedInput` above).
@@ -1154,8 +976,9 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                         {
                             let enabled =
                                 declaresReasoning
-                                ? (Self.thinkingEnabled(
-                                    for: request.contextOptions.reasoningLevel) ?? defaultOn)
+                                ? Self.thinkingEnabled(
+                                    for: request.contextOptions.reasoningLevel,
+                                    defaultOn: defaultOn)
                                 : false
                             toolAwareContext = [key: enabled]
                         } else {
@@ -1173,10 +996,10 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                                 from: enabledToolDefinitions)
                             let toolAwareInput = try await context.processor.prepare(
                                 input: UserInput(
-                                    chat: messages,
+                                    chat: promptMessages.withoutSchema,
                                     tools: toolSpecs,
                                     additionalContext: toolAwareContext))
-                            let reasoning = thinkThenCallConfig.map {
+                            let reasoning = routedReasoningConfig.map {
                                 (
                                     config: $0,
                                     primedInside: Self.reasoningPrimedInside(
@@ -1192,6 +1015,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                                 requestedMaxTokens: requestedMaxTokens,
                                 requestedTemperature: request.generationOptions.temperature,
                                 samplingConfiguration: requestedSamplingConfiguration,
+                                prefillStepSize: prefillStepSize,
                                 reasoningEntryID: reasoningEntryID,
                                 context: context,
                                 channel: channel)
@@ -1218,6 +1042,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                                     input: input,
                                     modelID: modelID,
                                     requestedMaxTokens: requestedMaxTokens,
+                                    prefillStepSize: prefillStepSize,
                                     entryID: entryID,
                                     context: context,
                                     channel: channel)
@@ -1245,7 +1070,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                             from: requiredToolDefinitions)
                         let toolAwareInput = try await context.processor.prepare(
                             input: UserInput(
-                                chat: messages,
+                                chat: promptMessages.withoutSchema,
                                 tools: toolSpecs,
                                 additionalContext: toolAwareContext))
 
@@ -1263,7 +1088,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                                 tools: requiredToolDefinitions
                             )
 
-                        let xgTokenizer = try await MLXLanguageModel.makeXGTokenizer(
+                        let grammarTokenizer = try await MLXLanguageModel.makeGrammarTokenizer(
                             modelID: modelID,
                             tokenizer: context.tokenizer
                         )
@@ -1271,7 +1096,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                             modelID: modelID,
                             kind: .structuralTag,
                             source: toolCallingGrammar,
-                            tokenizer: xgTokenizer,
+                            tokenizer: grammarTokenizer,
                             hostTokenizer: context.tokenizer,
                             fastForward: true
                         )
@@ -1314,6 +1139,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                                 requestedTemperature: request.generationOptions
                                     .temperature,
                                 samplingConfiguration: requestedSamplingConfiguration,
+                                prefillStepSize: prefillStepSize,
                                 reasoningEntryID: reasoningEntryID,
                                 responseEntryID: entryID,
                                 context: context, channel: channel)
@@ -1356,12 +1182,14 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                                 context: context,
                                 constraint: constraint,
                                 maxTokens: phase2MaxTokens,
-                                vocabSize: Int(xgTokenizer.vocabSize),
+                                vocabSize: Int(grammarTokenizer.vocabSize),
                                 completionReserve: completionReserve,
                                 hardReserve: hardReserve,
                                 closingBias: closingBias,
                                 whitespaceBias: whitespaceBias,
-                                whitespaceTokenIDs: whitespaceTokenIDs
+                                whitespaceTokenIDs: whitespaceTokenIDs,
+                                prefill: .init(
+                                    stepSize: prefillStepSize ?? PrefillParameters.defaultStepSize)
                             ) { text in
                                 outputBuffer += text
                                 GuidedGenerationDiagnosticSink.current?.recordEmit()
@@ -1407,6 +1235,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                             input: input,
                             modelID: modelID,
                             requestedMaxTokens: requestedMaxTokens,
+                            prefillStepSize: prefillStepSize,
                             entryID: entryID,
                             context: context,
                             channel: channel)
@@ -1417,6 +1246,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                             requestedMaxTokens: requestedMaxTokens,
                             requestedTemperature: request.generationOptions.temperature,
                             samplingConfiguration: requestedSamplingConfiguration,
+                            prefillStepSize: prefillStepSize,
                             responseEntryID: entryID,
                             reasoningEntryID: reasoningEntryID,
                             context: context,
@@ -1460,6 +1290,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             requestedMaxTokens: Int?,
             requestedTemperature: Double?,
             samplingConfiguration: MLXSamplingConfiguration?,
+            prefillStepSize: Int?,
             reasoningEntryID: String,
             context: ModelContext,
             channel: LanguageModelExecutorGenerationChannel
@@ -1467,7 +1298,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             let params = Self.makeParameters(
                 maxTokens: requestedMaxTokens ?? Self.defaultMaxTokens,
                 requestedTemperature: requestedTemperature,
-                samplingConfiguration: samplingConfiguration)
+                samplingConfiguration: samplingConfiguration,
+                prefillStepSize: prefillStepSize)
             let format = context.configuration.toolCallFormat ?? .json
             var router = AllowedToolOutputRouter(
                 format: format,
@@ -1477,7 +1309,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                 tokenizer: context.tokenizer,
                 tools: toolSpecs,
                 stopStrings: context.configuration.effectiveStopStrings)
-            var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
+            var detokenizer = context.tokenizer.makeStreamingDetokenizer()
             var result = AllowedToolGenerationResult()
             let (stream, task) = try generateProtocolTokensTask(
                 input: input,
@@ -1554,7 +1386,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                 protocolDecoder = decoder
                 finalReasoningText = reasoningText
             } else {
-                let chunks = consumeAllowedEvents(router.finish(), result: &result)
+                let pending = detokenizer.finish().map { router.process($0) } ?? []
+                let chunks = consumeAllowedEvents(pending + router.finish(), result: &result)
                 finalReasoningText = chunks.joined()
                 result.endedInsideReasoning = router.isInsideReasoning
             }
@@ -1647,18 +1480,19 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             input: LMInput,
             modelID: String,
             requestedMaxTokens: Int?,
+            prefillStepSize: Int?,
             entryID: String,
             context: ModelContext,
             channel: LanguageModelExecutorGenerationChannel
         ) async throws {
-            let xgTokenizer = try await MLXLanguageModel.makeXGTokenizer(
+            let grammarTokenizer = try await MLXLanguageModel.makeGrammarTokenizer(
                 modelID: modelID,
                 tokenizer: context.tokenizer)
             let constraint = try await MLXLanguageModel.makeConstraint(
                 modelID: modelID,
                 kind: .json,
                 source: schemaJSON,
-                tokenizer: xgTokenizer,
+                tokenizer: grammarTokenizer,
                 hostTokenizer: context.tokenizer,
                 fastForward: true)
             let maxTokens = requestedMaxTokens ?? Self.defaultMaxTokens
@@ -1690,12 +1524,13 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     context: context,
                     constraint: constraint,
                     maxTokens: maxTokens,
-                    vocabSize: Int(xgTokenizer.vocabSize),
+                    vocabSize: Int(grammarTokenizer.vocabSize),
                     completionReserve: completionReserve,
                     hardReserve: hardReserve,
                     closingBias: bias.closing,
                     whitespaceBias: bias.whitespace,
-                    whitespaceTokenIDs: bias.whitespaceTokenIDs
+                    whitespaceTokenIDs: bias.whitespaceTokenIDs,
+                    prefill: .init(stepSize: prefillStepSize ?? PrefillParameters.defaultStepSize)
                 ) { text in
                     textContinuation.yield(text)
                     GuidedGenerationDiagnosticSink.current?.recordEmit()
@@ -1742,6 +1577,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             requestedMaxTokens: Int?,
             requestedTemperature: Double?,
             samplingConfiguration: MLXSamplingConfiguration?,
+            prefillStepSize: Int?,
             entryID: String,
             context: ModelContext,
             channel: LanguageModelExecutorGenerationChannel
@@ -1751,7 +1587,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             let params = Self.makeParameters(
                 maxTokens: requestedMaxTokens ?? Self.defaultMaxTokens,
                 requestedTemperature: requestedTemperature,
-                samplingConfiguration: samplingConfiguration
+                samplingConfiguration: samplingConfiguration,
+                prefillStepSize: prefillStepSize
             )
 
             for await generation in try generate(
@@ -1778,10 +1615,17 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                         output: .init(
                             totalTokenCount: info.generationTokenCount, reasoningTokenCount: 0),
                         entryID: entryID, into: channel)
+                case .reasoning:
+                    // Dropped on purpose. Anything with a resolved config goes to
+                    // `runReasoning`, so reaching here means the caller did not declare
+                    // `.reasoning` and forwarding it would defeat the capability gate.
+                    break
                 case .toolCall(_):
                     break
                 case .rejectedToolCall(let rejection):
                     throw RejectedToolCallError(rejection)
+                case .steering:
+                    break
                 }
             }
         }
@@ -1794,6 +1638,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             requestedMaxTokens: Int?,
             requestedTemperature: Double?,
             samplingConfiguration: MLXSamplingConfiguration?,
+            prefillStepSize: Int?,
             responseEntryID: String,
             reasoningEntryID: String,
             context: ModelContext,
@@ -1807,6 +1652,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     requestedMaxTokens: requestedMaxTokens,
                     requestedTemperature: requestedTemperature,
                     samplingConfiguration: samplingConfiguration,
+                    prefillStepSize: prefillStepSize,
                     responseEntryID: responseEntryID,
                     reasoningEntryID: reasoningEntryID,
                     context: context,
@@ -1817,6 +1663,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     requestedMaxTokens: requestedMaxTokens,
                     requestedTemperature: requestedTemperature,
                     samplingConfiguration: samplingConfiguration,
+                    prefillStepSize: prefillStepSize,
                     entryID: responseEntryID,
                     context: context,
                     channel: channel)
@@ -1828,7 +1675,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         /// Routes thinking delimited by the model's reasoning markers to
         /// `.reasoning` events and the rest to `.response`, using a raw
         /// protocol-neutral token decoder when the format owns framing, or a
-        /// self-owned `NaiveStreamingDetokenizer` for ordinary formats. The loop
+        /// self-owned `StreamingDetokenizer` for ordinary formats. The loop
         /// sees real token IDs for an accurate reasoning token count.
         private func runReasoning(
             input: LMInput,
@@ -1837,6 +1684,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             requestedMaxTokens: Int?,
             requestedTemperature: Double?,
             samplingConfiguration: MLXSamplingConfiguration?,
+            prefillStepSize: Int?,
             responseEntryID: String,
             reasoningEntryID: String,
             context: ModelContext,
@@ -1845,17 +1693,20 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             let params = Self.makeParameters(
                 maxTokens: requestedMaxTokens ?? Self.defaultMaxTokens,
                 requestedTemperature: requestedTemperature,
-                samplingConfiguration: samplingConfiguration
+                samplingConfiguration: samplingConfiguration,
+                prefillStepSize: prefillStepSize
             )
 
-            var emitter = ReasoningEventEmitter(
-                config: reasoningConfig, primedInside: primedInside)
+            // The collector matches the delimiters by token id when the tokenizer
+            // has them as single tokens, and scans the decoded text otherwise.
+            var collector = ReasoningTokenCollector(
+                config: reasoningConfig, primedInside: primedInside,
+                tokenizer: context.tokenizer)
             let format = context.configuration.toolCallFormat ?? .json
             var protocolDecoder = format.makeProtocolTokenStreamDecoder(
                 tokenizer: context.tokenizer,
                 tools: nil,
                 stopStrings: context.configuration.effectiveStopStrings)
-            var detokenizer = NaiveStreamingDetokenizer(tokenizer: context.tokenizer)
             var reasoningTokenCount = 0
             var completionInfo: GenerateCompletionInfo?
             let (stream, task) = try generateProtocolTokensTask(
@@ -1903,16 +1754,13 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                             // token count. Closing delimiters are deliberately
                             // attributed to reasoning until the emitter consumes
                             // them, then the final usage count is clamped.
-                            if emitter.isInsideReasoning {
+                            if collector.isInsideReasoning {
                                 reasoningTokenCount += 1
                             }
-                            detokenizer.append(token: token)
-                            if let chunk = detokenizer.next() {
-                                for segment in emitter.process(chunk) {
-                                    await Self.send(
-                                        segment, responseEntryID: responseEntryID,
-                                        reasoningEntryID: reasoningEntryID, channel: channel)
-                                }
+                            for segment in collector.ingest(token) {
+                                await Self.send(
+                                    segment, responseEntryID: responseEntryID,
+                                    reasoningEntryID: reasoningEntryID, channel: channel)
                             }
                         }
                     case .info(let info):
@@ -1949,12 +1797,12 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                 }
                 protocolDecoder = decoder
             } else {
-                for segment in emitter.finalize() {
+                for segment in collector.finalize() {
                     await Self.send(
                         segment, responseEntryID: responseEntryID,
                         reasoningEntryID: reasoningEntryID, channel: channel)
                 }
-                endedInsideReasoning = emitter.isInsideReasoning
+                endedInsideReasoning = collector.isInsideReasoning
             }
 
             // If generation ended while still inside a thinking block, the model
@@ -2045,6 +1893,18 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             }
         }
 
+        /// The effective thinking state for a `.templateFlag` model: an
+        /// unspecified level defers to the template's own `defaultOn`.
+        ///
+        /// Resolve through this rather than collapsing the optional at the call site.
+        /// Reading `nil` as "on" holds only for a `defaultOn: true` family and
+        /// disagrees with the rendered prompt for Gemma 4, which defaults off.
+        static func thinkingEnabled(
+            for level: ContextOptions.ReasoningLevel?, defaultOn: Bool
+        ) -> Bool {
+            thinkingEnabled(for: level) ?? defaultOn
+        }
+
         /// Decodes the rendered prompt's tail and asks whether it ends inside an
         /// open reasoning block (some model families prefill the opening
         /// delimiter).
@@ -2073,10 +1933,9 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         private static func reasoningPrimedInside(
             input: LMInput, config: ReasoningConfig, tokenizer: any Tokenizer
         ) -> Bool {
-            let tokens = input.text.tokens.asArray(Int.self)
-            let renderedTail = tokenizer.decode(tokenIds: Array(tokens.suffix(64)))
-            return ReasoningEventEmitter.promptEndsInsideReasoning(
-                renderedPromptTail: renderedTail, config: config)
+            ReasoningEventEmitter.promptEndsInsideReasoning(
+                promptTokens: input.text.tokens.asArray(Int.self), config: config,
+                tokenizer: tokenizer)
         }
 
         /// Think-then-call Phase 1: generate reasoning unconstrained until
@@ -2099,6 +1958,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             maxTokens: Int,
             requestedTemperature: Double?,
             samplingConfiguration: MLXSamplingConfiguration?,
+            prefillStepSize: Int?,
             reasoningEntryID: String,
             responseEntryID: String,
             context: ModelContext,
@@ -2107,7 +1967,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             let params = Self.makeParameters(
                 maxTokens: maxTokens,
                 requestedTemperature: requestedTemperature,
-                samplingConfiguration: samplingConfiguration
+                samplingConfiguration: samplingConfiguration,
+                prefillStepSize: prefillStepSize
             )
             var collector = ReasoningTokenCollector(
                 config: config, primedInside: primedInside, tokenizer: context.tokenizer

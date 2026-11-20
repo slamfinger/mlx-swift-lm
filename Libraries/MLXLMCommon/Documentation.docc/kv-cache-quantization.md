@@ -64,9 +64,17 @@ before inference. A bounded compressed ring cache is not currently implemented.
 ``ChatSession/cacheStatus()`` is the unified diagnostic surface for legacy and
 typed configuration. It reports the normalized request, request source,
 planned or realized phase, flattened cache topology, per-layer capacity source,
-strategy state, skip reason, and the container-owned `processedTokenCount`.
-Aggregate compressed, pending, skipped, and capacity-application counts are
-available on the same value.
+strategy state, skip reason, allocated bytes, and the container-owned
+`processedTokenCount`. Aggregate compressed, pending, skipped, and
+capacity-application counts, and the live-layer `memoryBytes`, are available on the
+same value.
+
+``KVCacheStatus/checkpoint`` reports the longest saved prefix (`tokens`) and the
+cache memory retained by every checkpoint in bytes (`memory`). It is `nil` when no
+checkpoint is kept.
+The count covers cache tensors, including padding and lengths, rather than total
+checkpoint memory. Storage may be shared with the live cache or forks.
+
 ``LanguageModel/cacheStatus(parameters:)`` and
 ``ModelContainer/cacheStatus(parameters:)`` provide the same shape for planned
 caches. The lower-level ``kvCacheRuntimeReport(cache:configuration:)`` remains
@@ -76,6 +84,70 @@ A realized `ChatSession` cache is bound to its configuration. When parameters
 change, a session with a structured transcript rebuilds automatically on the
 next response. A restored raw cache has no transcript to replay and rejects an
 incompatible request; clear it or create a new session.
+
+## Reusing divergent prefixes
+
+Rotating caches normally discard history beyond their attention window. To reuse
+recent prefixes after rotation, opt into a bounded rewind reserve:
+
+```swift
+let parameters = GenerateParameters(
+    kvCache: KVCacheConfiguration(
+        rewind: try .init(maxTokens: 128)))
+```
+
+This retains up to 128 additional historical rows per rotating layer without
+widening its attention window. Full-attention caches already retain their history.
+The default has no reserve and preserves the existing memory bound. Multi-token
+prefill can temporarily retain more rows, as it does without a reserve.
+
+For each rotating layer, the extra retained storage is
+`batchSize * kvHeads * maxTokens * (keyHeadDim + valueHeadDim) * bytesPerElement`.
+For example, 128 reserve tokens with eight KV heads, 64-dimensional keys and values,
+and 16-bit storage add 256 KiB per layer at batch size one. This storage stays
+bounded as the conversation grows. It is not a limit on total process memory:
+prefill, temporary attention buffers, cache copies, and MLX's allocator pool also
+consume memory. Attention views slice contiguous rows directly and concatenate
+only the selected window when it crosses the ring boundary.
+
+``ChatSession`` checks the requested rewind against every layer's
+``KVCache/maxTrimCount``. Recurrent layers do not acquire rewind support from this
+option.
+
+For text-only conversations, the default balanced prefill also keeps a checkpoint
+before the assistant reply, including any reasoning block supplied by the template.
+If a later template drops that reply's reasoning, the session first tries an exact
+trim, then the saved checkpoint, then a full rebuild. Reuse requires an exact token
+prefix match; it preserves the computation for that prefix rather than changing the
+model's reasoning or attention window.
+Append-only turns keep the existing checkpoint without splitting prefill again.
+
+A reply to tool results keeps a second checkpoint, taken again at every tool step. A
+template can render the call in that reply differently from how the model wrote it,
+for example with its arguments in another order, so the next tool step resumes before
+the latest reply instead of before the first one. The session restores the longest
+checkpoint the new prompt starts with.
+
+The checkpoint copies only rotating and recurrent leaves, including inside composite
+caches. Global attention history is trimmed in place. Variance-normalized caches save
+only the incomplete raw tile and reuse the immutable compressed prefix. Crossing a
+tile boundary without that saved tail cannot be rewound exactly. Checkpoint storage
+is therefore bounded by window, recurrent-state, and raw-tile sizes, plus token-prefix
+metadata, rather than a second copy of the full attention history.
+
+Explicit `.unchunked` and `.remainder` prefill schedules keep their original forwards
+and do not create these checkpoints. Media, attention masks, draft caches, and unknown
+cache implementations retain the conservative rebuild path when exact reuse is unavailable.
+
+For raw caches, use ``canTrimPromptCache(_:numTokens:)`` or
+``trimPromptCache(_:numTokens:)``. The latter returns zero without modifying any
+layer when an exact rewind is unavailable. Calling ``RotatingKVCache/trim(_:)``
+directly can still discard more history than an exact rewind permits; a nonzero
+return alone does not establish that the earlier attention context was restored.
+
+The reserve and its retained history survive cache copying and serialization.
+Older readers reject the extended rotating-cache metadata rather than restoring
+it with the wrong attention window.
 
 ## Cache ownership and progress
 

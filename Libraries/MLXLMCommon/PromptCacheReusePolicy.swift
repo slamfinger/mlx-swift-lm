@@ -21,9 +21,9 @@ enum PromptCacheReuseDecision: Equatable {
     /// reproduce, in which case the ledger diverges from the render by design.
     case appendSuffix(suffixStart: Int, representedTokens: [Int])
 
-    /// Feed a suffix into the main cache while discarding an unusable draft
-    /// cache. The current generation must use the main model only; a later
-    /// turn may rebuild a draft cache from a reproducible prompt.
+    /// Feed a suffix into the main cache while discarding unusable speculative
+    /// state (an ordinary draft cache or an MTP continuation). The current
+    /// generation must use the main model only.
     case appendSuffixToMain(suffixStart: Int, representedTokens: [Int])
 
     /// The cache already represents a usable prefix, but this turn introduces
@@ -41,6 +41,15 @@ enum PromptCacheReuseDecision: Equatable {
     /// feed `promptTokens[commonPrefixLength...]`.
     case trimToCommonPrefix(commonPrefixLength: Int, trimCount: Int)
 
+    /// Rewind only the target cache, discard speculative state, and continue
+    /// target-only from the common prefix.
+    case trimToCommonPrefixMainOnly(commonPrefixLength: Int, trimCount: Int)
+
+    /// Return the main cache and its carried model state to the checkpoint
+    /// taken after `prefixLength` tokens, then feed `promptTokens[prefixLength...]`.
+    /// A cache that refuses the checkpoint must be downgraded to ``rebuild``.
+    case restoreCheckpoint(prefixLength: Int)
+
     /// The cache cannot be reconciled with this prompt. Discard it, drop any
     /// carried model state, and feed the whole prompt.
     case rebuild
@@ -48,9 +57,20 @@ enum PromptCacheReuseDecision: Equatable {
     /// `true` when a non-empty cached prefix is carried into this turn.
     var reusesCachedPrefix: Bool {
         switch self {
-        case .appendSuffix, .appendSuffixToMain, .appendMediaSuffix, .trimToCommonPrefix:
+        case .appendSuffix, .appendSuffixToMain, .appendMediaSuffix, .trimToCommonPrefix,
+            .trimToCommonPrefixMainOnly, .restoreCheckpoint:
             return true
         case .prefillAll, .rebuild:
+            return false
+        }
+    }
+
+    /// `true` when applying this decision drops cached positions past the reused prefix.
+    var rewinds: Bool {
+        switch self {
+        case .trimToCommonPrefix, .trimToCommonPrefixMainOnly, .restoreCheckpoint:
+            return true
+        case .prefillAll, .appendSuffix, .appendSuffixToMain, .appendMediaSuffix, .rebuild:
             return false
         }
     }
@@ -110,6 +130,35 @@ struct PromptCacheTurn: Sendable {
     var canSplitPreparedMedia: Bool = false
 }
 
+/// What speculative-cache reuse can safely accompany the authoritative main cache.
+enum SpeculativeCacheReuseCapability: Sendable {
+    /// Aligned speculative state can follow both suffix appends and target rewinds.
+    case reusable
+
+    /// Aligned speculative state can follow suffix appends, but a rewind must
+    /// discard it and continue with the main cache only.
+    case appendOnly
+
+    /// Missing ordinary draft-model state can be reconstructed from the full prompt.
+    case rebuildableFromPrompt
+
+    /// Speculative state cannot be used, but the valid main cache may continue alone.
+    case mainOnlyFallback
+
+    /// Speculative state can neither be reused nor reconstructed for this prompt.
+    case unavailable
+
+    /// Whether an existing speculative continuation can be used without rebuilding it.
+    var canContinueWithoutRebuild: Bool {
+        switch self {
+        case .reusable, .appendOnly:
+            true
+        case .rebuildableFromPrompt, .mainOnlyFallback, .unavailable:
+            false
+        }
+    }
+}
+
 /// What the caches currently hold.
 struct PromptCacheState: Sendable {
     /// Exact tokens the main cache represents, per the session's ledger. Empty
@@ -123,17 +172,15 @@ struct PromptCacheState: Sendable {
     /// The main cache's timeline agrees with the ledger length.
     var mainCacheIsAligned: Bool = false
 
-    /// A live draft cache is available for the next generation.
-    var hasDraftCache: Bool = false
+    /// The valid operations available for the auxiliary speculative state.
+    var speculativeReuseCapability: SpeculativeCacheReuseCapability = .unavailable
 
-    /// The draft cache's timeline agrees with the ledger length. This remains
-    /// `true` when no draft exists so generic main-only cache decisions keep
-    /// their existing behavior; protocol rules can inspect `hasDraftCache`
-    /// when absence matters.
-    var draftCacheIsAligned: Bool = true
+    /// Exact rewind limit across all participating layers.
+    var maxTrimCount: Int = 0
 
-    /// Every cache supports rewinding.
-    var isTrimmable: Bool = false
+    /// The length of a candidate checkpoint. Applying a restore must verify its
+    /// token prefix and cache compatibility before reusing it.
+    var checkpointLength: Int?
 }
 
 /// One reusability rule.
@@ -157,6 +204,7 @@ struct PromptCacheReusePolicy: Sendable {
         ExtendCachedPrefixRule(),
         AppendOnlyMediaRule(),
         RewindToCommonPrefixRule(),
+        RestoreCheckpointRule(),
     ]
 
     private let rules: [any PromptCacheReuseRule]
@@ -187,13 +235,27 @@ struct ExtendCachedPrefixRule: PromptCacheReuseRule {
     func reuse(turn: PromptCacheTurn, cache: PromptCacheState) -> PromptCacheReuseDecision? {
         guard !cache.cachedTokens.isEmpty,
             cache.mainCacheIsAligned,
-            cache.draftCacheIsAligned,
             !turn.carriesNewMedia,
             !turn.carriesAttentionMask,
             turn.promptTokens.count > cache.cachedTokens.count,
             turn.promptTokens.starts(with: cache.cachedTokens)
         else {
             return nil
+        }
+
+        if turn.usesSpeculativeDecoding {
+            switch cache.speculativeReuseCapability {
+            case .reusable, .appendOnly, .rebuildableFromPrompt:
+                return .appendSuffix(
+                    suffixStart: cache.cachedTokens.count,
+                    representedTokens: turn.promptTokens)
+            case .mainOnlyFallback:
+                return .appendSuffixToMain(
+                    suffixStart: cache.cachedTokens.count,
+                    representedTokens: turn.promptTokens)
+            case .unavailable:
+                return nil
+            }
         }
 
         return .appendSuffix(
@@ -223,7 +285,6 @@ struct AppendOnlyMediaRule: PromptCacheReuseRule {
             !turn.usesSpeculativeDecoding,
             !cache.cachedTokens.isEmpty,
             cache.mainCacheIsAligned,
-            cache.draftCacheIsAligned,
             turn.promptTokens.count > cache.cachedTokens.count,
             turn.promptTokens.starts(with: cache.cachedTokens)
         else {
@@ -235,9 +296,10 @@ struct AppendOnlyMediaRule: PromptCacheReuseRule {
     }
 }
 
-/// Rewinds to the longest common prefix, or rebuilds when that is unsafe.
+/// Trims back to the longest common prefix.
 ///
-/// This rule always decides, so it is the natural terminal rule.
+/// Declines when the trim is unsafe or out of reach, leaving the turn to a
+/// checkpoint or, failing that, the policy's rebuild.
 struct RewindToCommonPrefixRule: PromptCacheReuseRule {
     func reuse(turn: PromptCacheTurn, cache: PromptCacheState) -> PromptCacheReuseDecision? {
         // A cache at position zero has nothing to rewind and nothing to
@@ -256,21 +318,54 @@ struct RewindToCommonPrefixRule: PromptCacheReuseRule {
             && commonPrefixLength < turn.promptTokens.count
             && trimCount > 0
             && cache.mainCacheIsAligned
-            && cache.draftCacheIsAligned
-            && cache.isTrimmable
+            && trimCount <= cache.maxTrimCount
             && !turn.carriesNewMedia
             && !turn.carriesPreparedMedia
             && !turn.carriesAttentionMask
             && !turn.carriesModelState
 
-        guard canRewind else {
-            // The template changed an already-cached portion of the transcript,
-            // or this input carries state/media that cannot be rewound safely.
-            // Rebuild rather than combining a mismatched prompt with stale
-            // model state.
-            return .rebuild
+        // The template changed an already-cached portion of the transcript, or
+        // this input carries state/media that a trim cannot rewind safely.
+        guard canRewind else { return nil }
+
+        if turn.usesSpeculativeDecoding {
+            switch cache.speculativeReuseCapability {
+            case .reusable, .rebuildableFromPrompt:
+                return .trimToCommonPrefix(
+                    commonPrefixLength: commonPrefixLength, trimCount: trimCount)
+            case .appendOnly, .mainOnlyFallback:
+                return .trimToCommonPrefixMainOnly(
+                    commonPrefixLength: commonPrefixLength, trimCount: trimCount)
+            case .unavailable:
+                return .rebuild
+            }
         }
 
         return .trimToCommonPrefix(commonPrefixLength: commonPrefixLength, trimCount: trimCount)
+    }
+}
+
+/// Returns to a checkpoint when the cache cannot trim back to where the prompt
+/// diverges, as when a template drops a past reply's reasoning. Unlike a trim,
+/// a restore also returns the model state carried with the cache.
+struct RestoreCheckpointRule: PromptCacheReuseRule {
+    func reuse(turn: PromptCacheTurn, cache: PromptCacheState) -> PromptCacheReuseDecision? {
+        guard let checkpointLength = cache.checkpointLength,
+            checkpointLength > 0,
+            checkpointLength <= cache.cachedTokens.count,
+            checkpointLength < turn.promptTokens.count,
+            cache.mainCacheIsAligned,
+            // A restore returns the main cache only, so speculative state may
+            // follow it only when it is rebuilt from the prompt.
+            !turn.usesSpeculativeDecoding
+                || cache.speculativeReuseCapability == .rebuildableFromPrompt,
+            !turn.carriesNewMedia,
+            !turn.carriesPreparedMedia,
+            !turn.carriesAttentionMask,
+            turn.promptTokens.starts(with: cache.cachedTokens.prefix(checkpointLength))
+        else {
+            return nil
+        }
+        return .restoreCheckpoint(prefixLength: checkpointLength)
     }
 }

@@ -6,15 +6,32 @@ import MLXNN
 
 /// Abstract form of a model that processes language.
 public protocol BaseLanguageModel: Module {
+    /// Check whether the loaded tokenizer meets this model's requirements.
+    /// The default implementation accepts any tokenizer.
+    func validate(tokenizer: any Tokenizer) throws
+
+    /// Serialized namespaces whose tensors this model never loads, such as the target model in
+    /// a checkpoint that a drafter shares with it. The loader does not read them.
+    ///
+    /// Namespaces match whole dot-separated prefixes of the names before
+    /// ``prepareCheckpoint(_:)``. The default is empty.
+    var excludedCheckpointNamespaces: [String] { get }
+
+    /// Normalize tensor names, values, and layer settings before loading the checkpoint.
+    /// The default implementation calls ``sanitize(weights:metadata:)``.
+    func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint
+
     /// Optionally preprocess the weights and modify / remove values as needed.
-    func sanitize(weights: [String: MLXArray]) -> [String: MLXArray]
+    /// Errors propagate to the checkpoint loader.
+    func sanitize(weights: [String: MLXArray]) throws -> [String: MLXArray]
 
     /// Optionally preprocess the weights with access to safetensor metadata.
     ///
     /// The default implementation forwards to ``sanitize(weights:)``.
     /// Models can override this to inspect metadata (e.g. check `metadata["format"] == "mlx"`)
     /// and skip or customize sanitization accordingly.
-    func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String: MLXArray]
+    func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws -> [String:
+        MLXArray]
 }
 
 /// Weight files a model needs that no naming convention or `model.safetensors.index.json`
@@ -46,14 +63,25 @@ public protocol ModelConversionMetadataProvider {
 }
 
 extension BaseLanguageModel {
+    public func validate(tokenizer: any Tokenizer) throws {}
+
+    public var excludedCheckpointNamespaces: [String] { [] }
+
+    public func prepareCheckpoint(_ checkpoint: ModelCheckpoint) throws -> ModelCheckpoint {
+        var checkpoint = checkpoint
+        checkpoint.weights = try sanitize(
+            weights: checkpoint.weights, metadata: checkpoint.metadata)
+        return checkpoint
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights
     }
 
-    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) -> [String:
+    public func sanitize(weights: [String: MLXArray], metadata: [String: String]) throws -> [String:
         MLXArray]
     {
-        sanitize(weights: weights)
+        try sanitize(weights: weights)
     }
 }
 
@@ -107,6 +135,7 @@ public struct LMInput {
     public let image: ProcessedImage?
     public let video: ProcessedVideo?
     public let audio: ProcessedAudio?
+    public let multimodalTokenTypes: MLXArray?
 
     /// Representation of tokenized input text.
     public struct Text {
@@ -212,11 +241,54 @@ public struct LMInput {
         video: LMInput.ProcessedVideo? = nil,
         audio: LMInput.ProcessedAudio? = nil
     ) {
+        self.init(
+            text: text,
+            image: image,
+            video: video,
+            audio: audio,
+            multimodalTokenTypes: nil)
+    }
+
+    public init(
+        text: LMInput.Text,
+        image: LMInput.ProcessedImage? = nil,
+        video: LMInput.ProcessedVideo? = nil,
+        audio: LMInput.ProcessedAudio? = nil,
+        multimodalTokenTypes: MLXArray?
+    ) {
         self.text = text
         self.image = image
         self.video = video
         self.audio = audio
+        self.multimodalTokenTypes = multimodalTokenTypes
     }
+}
+
+/// Validate the shape shared by block-diffusion streaming and return the logical
+/// prompt positions selected by an optional attention mask. A `nil` result means
+/// every prompt position is valid and no gather is needed.
+package func blockDiffusionPromptIndices(
+    mask: MLXArray?, sequenceLength: Int, batchSize: Int, modelName: String
+) throws -> MLXArray? {
+    guard batchSize == 1 else {
+        throw GenerateError.unsupportedBatchSize(modelName: modelName, batchSize: batchSize)
+    }
+    guard let mask else { return nil }
+
+    let values = mask.asType(.bool).flattened().asArray(Bool.self)
+    guard values.count == sequenceLength else {
+        throw GenerateError.invalidAttentionMask(
+            "expected \(sequenceLength) values for a batch-one prompt, got \(values.count).")
+    }
+    guard values.contains(true) else {
+        throw GenerateError.invalidAttentionMask("the prompt cannot be entirely masked.")
+    }
+    guard values.contains(false) else { return nil }
+
+    return MLXArray(
+        values.enumerated().compactMap { index, isValid in
+            isValid ? Int32(index) : nil
+        })
 }
 
 /// ``LanguageModel`` step output. This is consumed internally
@@ -239,6 +311,8 @@ public struct LMOutput {
     }
 
     /// Dictionary of typed ``Key`` to carry state between steps.
+    /// Values must remain unchanged after a step returns. Later steps must produce new values
+    /// so sessions and checkpoints can safely retain earlier state.
     public struct State {
         private var contents: [String: Any]
 
@@ -271,6 +345,11 @@ public struct LMOutput {
             }
         }
 
+        /// Whether this state currently carries any model-owned values.
+        /// Package code uses this to avoid persisting a non-nil shell after
+        /// transient iterator exchange keys have been removed.
+        package var isEmpty: Bool { contents.isEmpty }
+
         enum SerializationError: LocalizedError {
             case unsupportedValue(key: String, type: String)
 
@@ -298,6 +377,17 @@ public enum PrepareResult {
     case logits(LMOutput)
 }
 
+/// Feature flags that describe generation behavior supported by a language model.
+public struct LMModelCapabilities: OptionSet, Sendable {
+    public let rawValue: Int
+
+    public init(rawValue: Int) {
+        self.rawValue = rawValue
+    }
+
+    public static let blockDiffusion = Self(rawValue: 1 << 0)
+}
+
 /// Interface for all Language Models (e.g. LLM, VLM).
 ///
 /// The language model is typically called by the ``TokenIterator`` and it:
@@ -316,6 +406,9 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
     /// exclusive access to the model; inference calls must remain read-only.
     func prepare() throws
 
+    /// Feature flags that describe generation behavior supported by the model.
+    var capabilities: LMModelCapabilities { get }
+
     /// Prepare the cache state and consume the ``LMInput``.
     ///
     /// `state` is the ``LMOutput/state`` a caller carried over from earlier
@@ -332,8 +425,8 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
     ///
     /// Implementations that chunk the prompt should drive the loop with
     /// ``PrefillParameters/forEachChunk(total:reserving:defaultStepSize:maximumStepSize:_:)``,
-    /// which owns cancellation, pooling, and per-chunk progress. An
-    /// implementation returning `.logits` owns its whole
+    /// which owns cancellation, pooling, buffer cache clearing, and per-chunk
+    /// progress. An implementation returning `.logits` owns its whole
     /// ``PrefillParameters/progress`` sequence, including the terminal
     /// `(total, total)`; one returning `.tokens` reports only its own chunks —
     /// the iterator that evaluates the remainder completes the sequence.
@@ -344,6 +437,14 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
 
     /// Primary entry point to produce a step (single token) from the model
     func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
+        -> LMOutput
+
+    /// Evaluate all input positions when only the final position's logits are needed.
+    ///
+    /// Implementations may omit earlier logit rows, but must preserve cache updates and
+    /// output state. The default uses the regular forward. Scoring and speculative
+    /// verification must use the regular forward when they need multiple positions.
+    func nextTokenLogits(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?)
         -> LMOutput
 
     /// Models may implement this simplified interface if they do not produce any ``LMOutput/State``
@@ -374,9 +475,84 @@ public protocol LanguageModel: BaseLanguageModel, ChatConventionsProviding {
     func cacheStatus(parameters: GenerateParameters?) throws -> KVCacheStatus
 }
 
+/// Optional interface for text diffusion models that generate a block of tokens
+/// at a time instead of predicting one next-token logit.
+public protocol BlockDiffusionLanguageModel: LanguageModel {
+    var diffusionCanvasLength: Int { get }
+    var diffusionMinimumCanvasLength: Int { get }
+    var diffusionMaxDenoisingSteps: Int { get }
+    var diffusionEntropyBound: Float { get }
+    var diffusionTemperatureMin: Float { get }
+    var diffusionTemperatureMax: Float { get }
+    var diffusionStabilityThreshold: Int { get }
+    var diffusionConfidenceThreshold: Float { get }
+    var diffusionVocabularySize: Int { get }
+    var diffusionDefaultMaxTokens: Int? { get }
+    var diffusionPrefersLogitsSelfConditioning: Bool { get }
+
+    func prepareDiffusion(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws
+    func acceptDiffusionTokens(_ tokens: MLXArray, cache: [KVCache], windowSize: Int?)
+    func diffusionLogits(
+        canvasTokens: MLXArray,
+        cache: [KVCache],
+        selfConditioningLogits: MLXArray?
+    ) -> MLXArray
+    func diffusionLogits(
+        canvasTokens: MLXArray,
+        cache: [KVCache],
+        selfConditioningEmbeddings: MLXArray?
+    ) -> MLXArray
+    func diffusionSelfConditioningWeight() -> MLXArray?
+    func diffusionSelfConditioningEmbeddings(logits: MLXArray, weight: MLXArray?) -> MLXArray
+}
+
+extension BlockDiffusionLanguageModel {
+    public var diffusionMinimumCanvasLength: Int { 64 }
+    public var diffusionTemperatureMin: Float { 0.4 }
+    public var diffusionTemperatureMax: Float { 0.8 }
+    public var diffusionStabilityThreshold: Int { 1 }
+    public var diffusionConfidenceThreshold: Float { 0.005 }
+    public var diffusionDefaultMaxTokens: Int? { nil }
+    public var diffusionPrefersLogitsSelfConditioning: Bool { false }
+
+    public func diffusionLogits(
+        canvasTokens: MLXArray,
+        cache: [KVCache],
+        selfConditioningEmbeddings: MLXArray?
+    ) -> MLXArray {
+        diffusionLogits(
+            canvasTokens: canvasTokens,
+            cache: cache,
+            selfConditioningLogits: selfConditioningEmbeddings)
+    }
+
+    public func diffusionSelfConditioningWeight() -> MLXArray? {
+        nil
+    }
+
+    public func diffusionSelfConditioningEmbeddings(logits: MLXArray, weight: MLXArray?) -> MLXArray
+    {
+        logits
+    }
+}
+
 extension LanguageModel {
+    public func nextTokenLogits(
+        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
+    ) -> LMOutput {
+        callAsFunction(input, cache: cache, state: state)
+    }
+
     /// Most language models have no derived inference state to prepare.
     public func prepare() throws {}
+
+    public var capabilities: LMModelCapabilities {
+        var capabilities: LMModelCapabilities = []
+        if self is any BlockDiffusionLanguageModel {
+            capabilities.insert(.blockDiffusion)
+        }
+        return capabilities
+    }
 
     @available(
         *, deprecated, renamed: "prepare(_:cache:state:prefill:)",
@@ -434,4 +610,21 @@ extension LanguageModel where Self: KVCacheDimensionProvider {
     // commonly conform to ``KVCacheDimensionProvider`` while overriding ``newCache``;
     // a kvHeads-based default would mis-report those layouts. The base
     // ``LanguageModel`` implementation classifies the caches ``newCache`` builds.
+}
+
+/// Optional capability for language models whose forward pass is a final-hidden-state
+/// stack followed by a vocabulary projection.
+///
+/// Callers can select positions before projecting, for example to score only the last
+/// token of each row. The model keeps ownership of normalization, masking, and the cache;
+/// pass ragged batches through ``withPreparedCache(_:lengths:_:)`` as for any forward pass.
+package protocol HiddenStateLanguageModel: LanguageModel {
+    /// Returns final, normalized hidden states `[batch, sequence, hidden]`.
+    func hiddenStates(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray
+
+    /// Projects hidden states `[..., hidden]` to vocabulary logits `[..., vocabulary]`.
+    ///
+    /// Include any logit scaling or soft-capping, so that projecting all positions gives the
+    /// same logits as ``LanguageModel/callAsFunction(_:cache:)``.
+    func projectLogits(_ hiddenStates: MLXArray) -> MLXArray
 }

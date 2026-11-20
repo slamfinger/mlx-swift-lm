@@ -18,8 +18,11 @@ import FoundationModels
 /// expected Swift type. Semantic correctness is not asserted -- the 0.5B
 /// model may produce surprising values, but the grammar constraint must
 /// guarantee structural validity.
-@Suite(.serialized, .timeLimit(.minutes(10)))
-struct GenerableRoundTripTests {
+extension ModelLoadingSuite {
+    @Suite(.serialized, .timeLimit(.minutes(10))) struct GenerableRoundTripTests {}
+}
+
+extension ModelLoadingSuite.GenerableRoundTripTests {
 
     // MARK: - Helpers
 
@@ -280,13 +283,13 @@ struct GenerableRoundTripTests {
         kvBits: Int? = nil
     ) async throws -> String {
         try await container.perform { context in
-            let xgTokenizer = try await MLXLanguageModel.makeXGTokenizer(
+            let grammarTokenizer = try await MLXLanguageModel.makeGrammarTokenizer(
                 modelID: modelID,
                 tokenizer: context.tokenizer
             )
 
             let constraint = try GrammarConstraint(
-                tokenizer: xgTokenizer,
+                tokenizer: grammarTokenizer,
                 jsonSchema: jsonSchema,
                 fastForward: true,
                 hostTokenizer: context.tokenizer
@@ -320,7 +323,7 @@ struct GenerableRoundTripTests {
                 context: context,
                 constraint: constraint,
                 maxTokens: maxTokens,
-                vocabSize: Int(xgTokenizer.vocabSize),
+                vocabSize: Int(grammarTokenizer.vocabSize),
                 kvBits: kvBits,
                 completionReserve: completionReserve,
                 hardReserve: hardReserve,

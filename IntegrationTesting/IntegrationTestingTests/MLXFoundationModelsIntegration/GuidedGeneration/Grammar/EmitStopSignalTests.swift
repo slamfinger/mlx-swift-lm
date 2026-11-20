@@ -30,8 +30,11 @@ import MLXLMCommon
 @testable import MLXFoundationModels
 @testable import MLXGuidedGeneration
 
-@Suite(.serialized, .timeLimit(.minutes(2)))
-struct EmitStopSignalTests {
+extension ModelLoadingSuite {
+    @Suite(.serialized, .timeLimit(.minutes(2))) struct EmitStopSignalTests {}
+}
+
+extension ModelLoadingSuite.EmitStopSignalTests {
 
     @Test("GuidedGenerationLoop honors emit=false during fast-forward yielding")
     func emitStopSignalHonoredDuringFastForward() async throws {
@@ -53,12 +56,12 @@ struct EmitStopSignalTests {
         let container = try await loadTestModelContainer(id: TestFixtures.defaultModelID)
 
         try await container.perform { context in
-            let xgTokenizer = try await MLXLanguageModel.makeXGTokenizer(
+            let grammarTokenizer = try await MLXLanguageModel.makeGrammarTokenizer(
                 modelID: TestFixtures.defaultModelID,
                 tokenizer: context.tokenizer
             )
             let constraint = try GrammarConstraint(
-                tokenizer: xgTokenizer,
+                tokenizer: grammarTokenizer,
                 jsonSchema: schema,
                 fastForward: true,
                 hostTokenizer: context.tokenizer
@@ -83,7 +86,7 @@ struct EmitStopSignalTests {
                 context: context,
                 constraint: constraint,
                 maxTokens: 128,
-                vocabSize: Int(xgTokenizer.vocabSize)
+                vocabSize: Int(grammarTokenizer.vocabSize)
             ) { _ in
                 callCount += 1
                 if firstFalseAt != nil {

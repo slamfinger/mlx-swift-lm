@@ -114,7 +114,7 @@ struct ContinuationAssertions {
             let (logitsW, _) = try prefill(model, t2, cache: cacheW, state: s1)
 
             XCTAssertLessThanOrEqual(
-                maxAbsDiff(logitsW, logitsF), max(noiseFloor * 10, 1e-3),
+                maxAbsDiff(logitsW, logitsF), max(noiseFloor * 10, MatmulPrecision.splitTolerance),
                 "warm continuation diverged from full prefill (noise floor \(noiseFloor))",
                 file: file, line: line)
         }
@@ -139,7 +139,7 @@ struct ContinuationAssertions {
             let (logitsW, _) = try prefill(model, t2, cache: cacheW, state: s1)
 
             XCTAssertLessThanOrEqual(
-                maxAbsDiff(logitsW, logitsF), 1e-3,
+                maxAbsDiff(logitsW, logitsF), MatmulPrecision.splitTolerance,
                 "state-threaded warm continuation diverged from full prefill",
                 file: file, line: line)
         }
@@ -150,11 +150,9 @@ struct ContinuationAssertions {
     /// suffix on turn 1's cache must land where a cold prefill of the whole prompt
     /// does -- but only if the vision encoder computes each image independently.
     ///
-    /// `expectsIsolation` says which model this is. `Qwen25VL` masks each frame to
-    /// itself, so the split is exact; `Qwen2VL` attends across the concatenated
-    /// buffer, so dropping the cached image changes the kept image's features and
-    /// the logits must differ. Asserting the divergence is what makes the
-    /// conformance a measured claim rather than a stated one.
+    /// `expectsIsolation` says whether the encoder keeps each image to itself. If it
+    /// does, the split is exact. If it attends across images, dropping the cached
+    /// image changes the kept image's features, so the logits must differ.
     func assertAppendOnlyMediaSplit<M: LanguageModel>(
         _ model: M, split: (LMInput, Int) -> LMInput?, expectsIsolation: Bool,
         file: StaticString = #filePath, line: UInt = #line
@@ -196,11 +194,11 @@ struct ContinuationAssertions {
             let diff = maxAbsDiff(logitsW, logitsF)
             if expectsIsolation {
                 XCTAssertLessThanOrEqual(
-                    diff, 1e-3,
+                    diff, MatmulPrecision.splitTolerance,
                     "split-suffix prefill diverged from full prefill", file: file, line: line)
             } else {
                 XCTAssertGreaterThan(
-                    diff, 1e-3,
+                    diff, MatmulPrecision.splitTolerance,
                     "cross-image vision attention should have changed the logits",
                     file: file, line: line)
             }
@@ -230,10 +228,58 @@ struct ContinuationAssertions {
             let (logitsW, _) = try prefill(model, t3, cache: cacheW, state: s2)
 
             XCTAssertLessThanOrEqual(
-                maxAbsDiff(logitsW, logitsF), 1e-3,
+                maxAbsDiff(logitsW, logitsF), MatmulPrecision.splitTolerance,
                 "post-image resume state positioned the following turn wrong",
                 file: file, line: line)
         }
+    }
+
+    /// The ChatSession append-only media flow end to end: turn 1 (an image) sits in the
+    /// cache, turn 2 (another image) arrives as a full prepared input that the model must
+    /// split at the turn boundary. The suffix — carrying only the second image — prefilled
+    /// on the carried state must land where one cold prefill of the concatenation does.
+    ///
+    /// The two images' pixel rows live in one buffer, and the prefix run slices the same
+    /// tensor, so every arm sees byte-identical features and any divergence is positional.
+    func assertSplitMediaSuffixContinuation<M: LanguageModel & PreparedInputSplitting>(
+        _ model: M, file: StaticString = #filePath, line: UInt = #line
+    ) throws {
+        MLXRandom.seed(17)
+        let t1 = concatenated([textTokens(10), imageRun(), textTokens(6, seed: 5)], axis: 1)
+        let t2 = concatenated(
+            [textTokens(4, seed: 8), imageRun(), textTokens(5, seed: 9)], axis: 1)
+        let full = concatenated([t1, t2], axis: 1)
+
+        let pixels = MLXRandom.normal([32, 3 * 2 * 16 * 16])
+        let bothImages = LMInput.ProcessedImage(
+            pixels: pixels, frames: [THW(1, 4, 4), THW(1, 4, 4)])
+        let firstImage = LMInput.ProcessedImage(
+            pixels: pixels[0 ..< 16, 0...], frames: [THW(1, 4, 4)])
+
+        let cacheF = try model.newCache(parameters: nil)
+        let (logitsF, _) = try prefill(model, full, image: bothImages, cache: cacheF)
+
+        let cacheW = try model.newCache(parameters: nil)
+        let (_, s1) = try prefill(model, t1, image: firstImage, cache: cacheW)
+
+        let prepared = LMInput(text: .init(tokens: full), image: bothImages)
+        let suffix = try XCTUnwrap(
+            model.splitPreparedInput(prepared, droppingFirst: t1.dim(1)),
+            "split refused a boundary between two turns", file: file, line: line)
+        XCTAssertEqual(
+            suffix.text.tokens.asArray(Int32.self), t2.asArray(Int32.self),
+            "suffix tokens must be exactly the second turn", file: file, line: line)
+        XCTAssertEqual(
+            suffix.image?.frames?.count, 1,
+            "suffix must retain exactly one image", file: file, line: line)
+
+        let (logitsW, _) = try lastLogits(
+            model.prepare(suffix, cache: cacheW, state: s1, prefill: PrefillParameters()))
+
+        XCTAssertLessThanOrEqual(
+            maxAbsDiff(logitsW, logitsF), MatmulPrecision.splitTolerance,
+            "split media suffix continuation diverged from full prefill",
+            file: file, line: line)
     }
 
     /// Windowed (chunked) prefill must agree with the single-shot forward on plain text.
@@ -250,7 +296,7 @@ struct ContinuationAssertions {
             let (logitsC, _) = try prefill(model, prompt, cache: cacheC, stepSize: 8)
 
             XCTAssertLessThanOrEqual(
-                maxAbsDiff(logitsC, logitsS), 1e-3,
+                maxAbsDiff(logitsC, logitsS), MatmulPrecision.splitTolerance,
                 "windowed prefill diverged from single-shot", file: file, line: line)
         }
     }
@@ -280,7 +326,7 @@ struct ContinuationAssertions {
                     model, prompt, image: image, cache: cacheC, stepSize: stepSize)
 
                 XCTAssertLessThanOrEqual(
-                    maxAbsDiff(logitsC, logitsS), 1e-3,
+                    maxAbsDiff(logitsC, logitsS), MatmulPrecision.splitTolerance,
                     "windowed image prefill diverged from single-shot at stepSize \(stepSize)",
                     file: file, line: line)
             }
