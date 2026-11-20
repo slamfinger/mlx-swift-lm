@@ -16,7 +16,7 @@ final class Qwen3MoEDirectReductionTests: XCTestCase {
                 "intermediate_size": 128,
                 "moe_intermediate_size": 64,
                 "num_hidden_layers": 1,
-                "num_experts": 8,
+                "num_experts": 16,
                 "num_experts_per_tok": 8,
                 "decoder_sparse_step": 1,
                 "mlp_only_layers": [],
@@ -35,7 +35,7 @@ final class Qwen3MoEDirectReductionTests: XCTestCase {
         // expert projections, as in the quantized inference model.
         try block.update(
             parameters: ModuleParameters.unflattened([
-                "gate.weight": MLXRandom.normal([8, 64]).asType(.bfloat16)
+                "gate.weight": MLXRandom.normal([16, 64]).asType(.bfloat16)
             ]),
             verify: [])
         quantize(model: block.switchMLP, groupSize: 32, bits: 4)
